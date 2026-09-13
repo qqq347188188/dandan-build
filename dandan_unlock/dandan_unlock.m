@@ -53,10 +53,10 @@ struct fbt_rebinding { const char *name; void *replacement; void **replaced; };
 struct fbt_entry { struct fbt_rebinding *r; size_t n; struct fbt_entry *next; };
 static struct fbt_entry *fbt_head;
 static const char *g_cur_img = "";
-static char g_rb_log[4096];
+static char g_rb_log[16384];
 static void rb_note(const char *sym, const char *img) {
     size_t cur = strlen(g_rb_log);
-    if (cur > 3500 || !sym || !img) return;
+    if (cur > 15000 || !sym || !img) return;
     snprintf(g_rb_log + cur, sizeof(g_rb_log) - cur, "%s @ %s\n", sym, img);
 }
 
@@ -332,6 +332,7 @@ typedef struct {
 static Conn g_conn[MAXFD];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int g_inside = 0;
+static int g_seen_connect = 0, g_seen_read = 0, g_seen_write = 0;
 
 static void conn_reset(Conn *c) {
     if (c->out) { free(c->out); c->out = NULL; }
@@ -399,6 +400,7 @@ static id my_wvLoad(id self, SEL _cmd, NSURLRequest *req) {
 // ============================ Hooks ============================
 static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
     if (g_inside || !o_connect) return o_connect(fd, addr, al);
+    if (!g_seen_connect) { g_seen_connect = 1; DLog(@"[hook] my_connect 首次被调用"); }
     g_inside = 1;
     int r = o_connect(fd, addr, al);
     if (r == 0 && addr && addr->sa_family == AF_INET) {
@@ -412,7 +414,7 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
             g_conn[fd].tracked = 1; g_conn[fd].patch = 0;
             pthread_mutex_unlock(&g_lock);
             DLog(@"[socket] 命中目标连接 fd=%d %s:%d", fd, ip, TARGET_PORT);
-        } else if (port == 80 || port == 443 || port == 8080) {
+        } else {
             DLog(@"[socket] connect %s:%d", ip, port);
         }
     }
@@ -422,6 +424,7 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
 
 static ssize_t my_write(int fd, const void *buf, size_t len) {
     if (g_inside || !o_write) return o_write(fd, buf, len);
+    if (!g_seen_write) { g_seen_write = 1; DLog(@"[hook] my_write 首次被调用"); }
     int tracked = 0;
     if (fd >= 0 && fd < MAXFD) tracked = g_conn[fd].tracked;
     if (!tracked || !buf || !len) return o_write(fd, buf, len);
@@ -445,6 +448,7 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
 
 static ssize_t my_read(int fd, void *buf, size_t count) {
     if (g_inside || !o_read) return o_read(fd, buf, count);
+    if (!g_seen_read) { g_seen_read = 1; DLog(@"[hook] my_read 首次被调用"); }
     int tracked = 0, patch = 0;
     if (fd >= 0 && fd < MAXFD) { tracked = g_conn[fd].tracked; patch = g_conn[fd].patch; }
     if (!tracked || !patch || !buf || count == 0) return o_read(fd, buf, count);
@@ -528,7 +532,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v9 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v10 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
