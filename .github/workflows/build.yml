@@ -14,7 +14,7 @@ jobs:
           echo "Source file: $SRC"
           xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc \
             -miphoneos-version-min=15.0 \
-            -framework Foundation \
+            -framework Foundation -framework UIKit -framework WebKit \
             -o dandan_unlock.dylib "$SRC"
 
       - name: Verify
