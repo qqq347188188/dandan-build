@@ -309,14 +309,9 @@ static NSData *rewrite_request(const void *buf, size_t len) {
         while (v < n && mb[v] != '\r' && mb[v] != '\n') v++;
         if (v > j) memset(mb + j, 'x', v - j);   // 未知编码 -> 服务器按 identity 处理（不压缩）
     }
-    size_t off = 0;
-    while (off + 8 <= n) {
-        const unsigned char *q = (const unsigned char *)fb_memmem(mb + off, n - off, "HTTP/1.1", 8);
-        if (!q) break;
-        size_t idx = (size_t)(q - (mb + off)) + off;
-        memcpy(mb + idx, "HTTP/1.0", 8);
-        off = idx + 8;
-    }
+    // 注意：不再把 HTTP/1.1 改成 HTTP/1.0。
+    // 降级会让服务器响应后关闭连接，而 Dart 的 HttpClient 仍按 keep-alive 复用该连接，
+    // 导致 "Connection closed while receiving data"。这里保持请求版本不变。
     return m;
 }
 
@@ -534,7 +529,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v12 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v13 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
