@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -30,6 +31,8 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
+
+static void DLog(NSString *fmt, ...);
 
 // ============================ fishhook ============================
 #ifdef __LP64__
@@ -49,6 +52,13 @@ typedef struct nlist              fbt_nlist;
 struct fbt_rebinding { const char *name; void *replacement; void **replaced; };
 struct fbt_entry { struct fbt_rebinding *r; size_t n; struct fbt_entry *next; };
 static struct fbt_entry *fbt_head;
+static const char *g_cur_img = "";
+static char g_rb_log[4096];
+static void rb_note(const char *sym, const char *img) {
+    size_t cur = strlen(g_rb_log);
+    if (cur > 3500 || !sym || !img) return;
+    snprintf(g_rb_log + cur, sizeof(g_rb_log) - cur, "%s @ %s\n", sym, img);
+}
 
 static int fbt_prepend(struct fbt_rebinding rb[], size_t n) {
     struct fbt_entry *e = (struct fbt_entry *)malloc(sizeof(struct fbt_entry));
@@ -91,6 +101,7 @@ static void fbt_do_section(struct fbt_entry *rb, fbt_section *sect,
                     if (cur->r[j].replaced && bind[i] != cur->r[j].replacement)
                         *(cur->r[j].replaced) = bind[i];
                     bind[i] = cur->r[j].replacement;
+                    rb_note(cur->r[j].name, g_cur_img);
                     goto next_sym;
                 }
             }
@@ -101,8 +112,7 @@ static void fbt_do_section(struct fbt_entry *rb, fbt_section *sect,
 
 static void fbt_image(struct fbt_entry *rb, const struct mach_header *h, intptr_t slide) {
     Dl_info info; if (dladdr(h, &info) == 0) return;
-    // 只处理 App 自己的镜像（主程序 + Frameworks），跳过 /usr/lib 等系统库
-    if (info.dli_fname && !strstr(info.dli_fname, ".app")) return;
+    g_cur_img = info.dli_fname ? info.dli_fname : "";
     fbt_segment_command *cur = NULL, *linkedit = NULL;
     struct symtab_command *symtab_cmd = NULL;
     struct dysymtab_command *dysymtab_cmd = NULL;
@@ -412,14 +422,13 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
 
 static ssize_t my_write(int fd, const void *buf, size_t len) {
     if (g_inside || !o_write) return o_write(fd, buf, len);
-    g_inside = 1;
     int tracked = 0;
-    pthread_mutex_lock(&g_lock);
     if (fd >= 0 && fd < MAXFD) tracked = g_conn[fd].tracked;
-    pthread_mutex_unlock(&g_lock);
+    if (!tracked || !buf || !len) return o_write(fd, buf, len);
+    g_inside = 1;
 
     ssize_t r;
-    if (tracked && buf && len) {
+    if (1) {
         int isProfile = fb_memmem(buf, len, "profiles", 8) ? 1 : 0;
         NSData *nb = rewrite_request(buf, len);
         pthread_mutex_lock(&g_lock);
@@ -436,19 +445,12 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
 
 static ssize_t my_read(int fd, void *buf, size_t count) {
     if (g_inside || !o_read) return o_read(fd, buf, count);
+    int tracked = 0, patch = 0;
+    if (fd >= 0 && fd < MAXFD) { tracked = g_conn[fd].tracked; patch = g_conn[fd].patch; }
+    if (!tracked || !patch || !buf || count == 0) return o_read(fd, buf, count);
     g_inside = 1;
 
-    int tracked = 0, patch = 0;
-    pthread_mutex_lock(&g_lock);
-    if (fd >= 0 && fd < MAXFD) { tracked = g_conn[fd].tracked; patch = g_conn[fd].patch; }
-    pthread_mutex_unlock(&g_lock);
-
     ssize_t r;
-    if (!tracked || !patch || !buf || count == 0) {
-        r = o_read(fd, buf, count);
-        g_inside = 0;
-        return r;
-    }
 
     // 先吐上次没吐完的
     pthread_mutex_lock(&g_lock);
@@ -511,6 +513,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         { "write",   (void *)my_write,   (void **)&o_write },
     };
     int ret = fbt_rebind(rb, sizeof(rb) / sizeof(rb[0]));
+    if (g_rb_log[0]) DLog(@"[rebind] 已替换:\n%s", g_rb_log);
 
     Class wv = objc_getClass("WKWebView");
     if (wv) {
@@ -525,7 +528,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v8 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v9 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
