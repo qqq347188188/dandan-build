@@ -424,8 +424,6 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
             g_conn[fd].tracked = 1; g_conn[fd].patch = 0;
             pthread_mutex_unlock(&g_lock);
             DLog(@"[socket] 命中目标连接 fd=%d %s:%d", fd, ip, TARGET_PORT);
-        } else {
-            DLog(@"[socket] connect %s:%d", ip, port);
         }
     }
     g_inside = 0;
@@ -447,7 +445,6 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
         pthread_mutex_lock(&g_lock);
         if (fd >= 0 && fd < MAXFD) { conn_reset(&g_conn[fd]); g_conn[fd].tracked = 1; g_conn[fd].patch = isProfile; }
         pthread_mutex_unlock(&g_lock);
-        DLog(@"[socket] 请求 fd=%d len=%lu profiles=%d", fd, (unsigned long)len, isProfile);
         r = o_write(fd, nb.bytes, nb.length);
     } else {
         r = o_write(fd, buf, len);
@@ -485,7 +482,6 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
 
     // 只有本次读到的是一个完整响应才改写，否则原样放过
     if (!response_complete((const unsigned char *)buf, (size_t)r)) {
-        DLog(@"[socket] 响应未识别(透传) fd=%d len=%ld", fd, (long)r);
         g_inside = 0;
         return r;
     }
@@ -543,7 +539,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v14 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v15 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
