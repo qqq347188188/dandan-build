@@ -1,0 +1,29 @@
+名称: 构建 dandan_unlock.dylib
+
+在:
+  workflow_dispatch:
+  推送:
+    路径:
+      - 'dandan_unlock.m'
+
+职位:
+  构建:
+    运行于: macos-latest
+    步骤:
+      - 使用: actions/checkout@v4
+
+      - 名称: 编译 iOS arm64 dylib
+        运行: |
+          clang -dynamiclib -arch arm64 -fobjc-arc \
+            -miphoneos-version-min=15.0 \
+            -o dandan_unlock.dylib \
+            dandan_unlock.m
+
+      - 名称: 验证
+        运行: 文件 dandan_unlock.dylib
+
+      - 名称: 上传工件
+        使用: actions/upload-artifact@v4
+        与:
+          名称: dandan_unlock.dylib
+          路径: dandan_unlock.dylib
