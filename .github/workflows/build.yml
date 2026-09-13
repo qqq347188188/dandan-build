@@ -12,8 +12,9 @@ jobs:
         run: |
           SRC=$(find . -name dandan_unlock.m | head -n 1)
           echo "Source file: $SRC"
-          clang -dynamiclib -arch arm64 -fobjc-arc \
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc \
             -miphoneos-version-min=15.0 \
+            -framework Foundation \
             -o dandan_unlock.dylib "$SRC"
 
       - name: Verify
