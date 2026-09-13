@@ -261,6 +261,19 @@ static NSData *patched_response(NSData *raw) {
     NSData *nb = [NSJSONSerialization dataWithJSONObject:json options:0 error:&e];
     if (!nb || nb.length == 0) return raw;
 
+    {
+        long clOld = parse_content_length(b, hdrEnd);
+        char po[161] = {0}, pn2[161] = {0};
+        size_t olen = (len - hdrEnd) < 160 ? (len - hdrEnd) : 160;
+        size_t nlen = nb.length < 160 ? nb.length : 160;
+        memcpy(po, b + hdrEnd, olen);
+        memcpy(pn2, nb.bytes, nlen);
+        DLog(@"[resp] CL_old=%ld hdr=%lu body_old=%lu body_new=%lu", clOld, (unsigned long)hdrEnd,
+             (unsigned long)(len - hdrEnd), (unsigned long)nb.length);
+        DLog(@"[resp] old=%s", po);
+        DLog(@"[resp] new=%s", pn2);
+    }
+
     NSString *hs = [[NSString alloc] initWithData:[NSData dataWithBytes:b length:hdrEnd]
                                          encoding:NSISOLatin1StringEncoding];
     if (!hs) return raw;
@@ -472,6 +485,7 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
 
     // 只有本次读到的是一个完整响应才改写，否则原样放过
     if (!response_complete((const unsigned char *)buf, (size_t)r)) {
+        DLog(@"[socket] 响应未识别(透传) fd=%d len=%ld", fd, (long)r);
         g_inside = 0;
         return r;
     }
@@ -529,7 +543,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v13 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v14 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
