@@ -1,29 +1,26 @@
-名称: 构建 dandan_unlock.dylib
+name: Build dandan_unlock.dylib
 
-在:
-  workflow_dispatch:
-  推送:
-    路径:
-      - 'dandan_unlock.m'
+on: [workflow_dispatch, push]
 
-职位:
-  构建:
-    运行于: macos-latest
-    步骤:
-      - 使用: actions/checkout@v4
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - 名称: 编译 iOS arm64 dylib
-        运行: |
+      - name: Compile iOS arm64 dylib
+        run: |
+          SRC=$(find . -name dandan_unlock.m | head -n 1)
+          echo "Source file: $SRC"
           clang -dynamiclib -arch arm64 -fobjc-arc \
             -miphoneos-version-min=15.0 \
-            -o dandan_unlock.dylib \
-            dandan_unlock.m
+            -o dandan_unlock.dylib "$SRC"
 
-      - 名称: 验证
-        运行: 文件 dandan_unlock.dylib
+      - name: Verify
+        run: file dandan_unlock.dylib
 
-      - 名称: 上传工件
-        使用: actions/upload-artifact@v4
-        与:
-          名称: dandan_unlock.dylib
-          路径: dandan_unlock.dylib
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dandan_unlock.dylib
+          path: dandan_unlock.dylib
