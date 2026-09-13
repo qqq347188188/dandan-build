@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -57,10 +58,24 @@ static int fbt_prepend(struct fbt_rebinding rb[], size_t n) {
     return 0;
 }
 
+// 把 [addr, addr+len) 所在页改成可写；失败返回 0
+static int fbt_make_writable(void *addr, size_t len) {
+    if (!addr || len == 0) return 0;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(ps - 1);
+    uintptr_t end   = ((uintptr_t)addr + len + (uintptr_t)ps - 1) & ~(uintptr_t)(ps - 1);
+    return mprotect((void *)start, (size_t)(end - start), PROT_READ | PROT_WRITE) == 0;
+}
+
 static void fbt_do_section(struct fbt_entry *rb, fbt_section *sect,
                            intptr_t slide, fbt_nlist *symtab, char *strtab, uint32_t *indirect) {
+    if (!sect || sect->size == 0) return;
     uint32_t *idx = indirect + sect->reserved1;
     void **bind = (void **)((uintptr_t)slide + sect->addr);
+    if (!bind) return;
+    // iOS 上 __DATA_CONST 是只读段，直接写会 SIGBUS，先改成可写
+    if (!fbt_make_writable(bind, (size_t)sect->size)) return;
     for (uint32_t i = 0; i < sect->size / sizeof(void *); i++) {
         uint32_t si = idx[i];
         if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL ||
@@ -84,6 +99,8 @@ static void fbt_do_section(struct fbt_entry *rb, fbt_section *sect,
 
 static void fbt_image(struct fbt_entry *rb, const struct mach_header *h, intptr_t slide) {
     Dl_info info; if (dladdr(h, &info) == 0) return;
+    // 只处理 App 自己的镜像（主程序 + Frameworks），跳过 /usr/lib 等系统库
+    if (info.dli_fname && !strstr(info.dli_fname, ".app")) return;
     fbt_segment_command *cur = NULL, *linkedit = NULL;
     struct symtab_command *symtab_cmd = NULL;
     struct dysymtab_command *dysymtab_cmd = NULL;
@@ -442,6 +459,6 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
     };
     int ret = fbt_rebind(rb, sizeof(rb) / sizeof(rb[0]));
 
-    DLog(@"=== dandan_unlock v6 已加载 (rebind=%d, Flutter=%s) ===", ret,
+    DLog(@"=== dandan_unlock v7 已加载 (rebind=%d, Flutter=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no");
 }
