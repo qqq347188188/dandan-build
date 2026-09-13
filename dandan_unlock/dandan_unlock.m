@@ -403,7 +403,10 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
     if (!g_seen_connect) { g_seen_connect = 1; DLog(@"[hook] my_connect 首次被调用"); }
     g_inside = 1;
     int r = o_connect(fd, addr, al);
-    if (r == 0 && addr && addr->sa_family == AF_INET) {
+    int cerrno = errno;
+    // 非阻塞 socket 的 connect 会返回 -1/EINPROGRESS（连接在后台继续），也算成功
+    int ok = (r == 0) || (r == -1 && cerrno == EINPROGRESS);
+    if (ok && addr && addr->sa_family == AF_INET) {
         const struct sockaddr_in *s = (const struct sockaddr_in *)addr;
         int port = ntohs(s->sin_port);
         char ip[INET_ADDRSTRLEN] = {0};
@@ -532,7 +535,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v10 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v11 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
