@@ -298,19 +298,18 @@ static NSData *rewrite_request(const void *buf, size_t len) {
         }
         if (ok) { ki = (long)i; break; }
     }
-    NSMutableData *m;
+    // 关键：必须保持请求长度一字不变，否则会破坏 Dart 非阻塞 socket 的写状态机 / HTTP 流
+    NSMutableData *m = [NSMutableData dataWithBytes:buf length:len];
+    unsigned char *mb = (unsigned char *)m.mutableBytes;
+    size_t n = m.length;
     if (ki >= 0) {
         size_t j = (size_t)ki + keyLen;
-        while (j + 1 < len && !(b[j] == '\r' && b[j + 1] == '\n')) j++;
-        m = [NSMutableData data];
-        [m appendBytes:b length:(size_t)ki + keyLen];
-        [m appendBytes:" identity" length:9];
-        [m appendBytes:(b + j) length:(len - j)];
-    } else {
-        m = [NSMutableData dataWithBytes:buf length:len];
+        while (j < n && (mb[j] == ' ' || mb[j] == '\t')) j++;
+        size_t v = j;
+        while (v < n && mb[v] != '\r' && mb[v] != '\n') v++;
+        if (v > j) memset(mb + j, 'x', v - j);   // 未知编码 -> 服务器按 identity 处理（不压缩）
     }
-    unsigned char *mb = (unsigned char *)m.mutableBytes;
-    size_t n = m.length, off = 0;
+    size_t off = 0;
     while (off + 8 <= n) {
         const unsigned char *q = (const unsigned char *)fb_memmem(mb + off, n - off, "HTTP/1.1", 8);
         if (!q) break;
@@ -535,7 +534,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v11 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v12 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
