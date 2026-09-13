@@ -1,14 +1,15 @@
 //
-//  dandan_unlock.m  (v3)
+//  dandan_unlock.m  (v4)
 //  蛋蛋不语 VIP 解锁 dylib
 //
-//  背景：抓包发现会员接口是 Supabase(PostgREST) 的 http://38.76.202.248:8000//rest/v1/profiles
-//        且请求在 WebView(网页壳) 的 JS 里发出，不走 App 的 NSURLSession。
-//  做法：往 App 的 WKWebView 注入 JS，重写 fetch / XMLHttpRequest，
-//        在 JS 层把返回 JSON 里的 vip_status / vip_level / vip_expire_at 改成 VIP 值。
-//        （等价于圈X 的 script-response-body，但作用在页面 JS 层）
+//  目标接口：http://38.76.202.248:8000//rest/v1/profiles?select=*&id=eq.<uuid>  (Supabase/PostgREST)
+//  返回 JSON 里含 vip_status / vip_level / vip_expire_at。
 //
-//  同时保留 NSURLSession 的 completion / delegate hook，以防有请求仍走原生网络。
+//  v4：
+//   - 往 WKWebView 注入 JS，重写 fetch / XMLHttpRequest，在 JS 层把返回 JSON 改成 VIP 值；
+//   - 注入点用 WKWebViewConfiguration.userContentController 的 getter（覆盖所有创建方式）；
+//   - 加日志探测：App 是否真的创建了 WKWebView / 是否为 Flutter；
+//   - 保留 NSURLSession 原生 hook 兜底。
 //
 
 #import <Foundation/Foundation.h>
@@ -45,8 +46,7 @@ static void DLog(NSString *fmt, ...) {
     } @catch (__unused NSException *e) {}
 }
 
-// ================= 注入到网页的 JS =================
-// 注意：整段不含双引号，可直接放进 @"..."
+// ================= 注入到网页的 JS（整段不含双引号） =================
 static NSString *DandanJS(void) {
     static NSString *js;
     static dispatch_once_t once;
@@ -57,10 +57,12 @@ static NSString *DandanJS(void) {
 }
 
 // ================= WKWebView 注入 =================
-static void dandanAddScript(WKWebViewConfiguration *config) {
-    if (!config) return;
-    WKUserContentController *ucc = config.userContentController;
-    if (!ucc) { ucc = [[WKUserContentController alloc] init]; config.userContentController = ucc; }
+static const void *kDandanUCCKey = &kDandanUCCKey;
+
+static void dandanAttach(WKUserContentController *ucc) {
+    if (!ucc) return;
+    if (objc_getAssociatedObject(ucc, kDandanUCCKey)) return;
+    objc_setAssociatedObject(ucc, kDandanUCCKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     WKUserScript *s = [[WKUserScript alloc] initWithSource:DandanJS()
                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                           forMainFrameOnly:NO];
@@ -68,27 +70,36 @@ static void dandanAddScript(WKWebViewConfiguration *config) {
     DLog(@"[WKWebView] 已注入 userScript");
 }
 
+static void dandanAddScript(WKWebViewConfiguration *config) {
+    if (!config) return;
+    WKUserContentController *ucc = config.userContentController;
+    if (!ucc) { ucc = [[WKUserContentController alloc] init]; config.userContentController = ucc; }
+    dandanAttach(ucc);
+}
+
+// 主注入点：- [WKWebViewConfiguration userContentController] （任何 WKWebView 加载前都会读它）
+static id (*orig_uccGetter)(id, SEL);
+static id hook_uccGetter(id self, SEL _cmd) {
+    id ucc = orig_uccGetter(self, _cmd);
+    @try { dandanAttach(ucc); } @catch (__unused NSException *e) {}
+    return ucc;
+}
+
 static id (*orig_wvInit)(id, SEL, CGRect, id);
 static id hook_wvInit(id self, SEL _cmd, CGRect frame, id config) {
+    DLog(@"[WKWebView] initWithFrame:configuration:");
     @try { dandanAddScript(config); } @catch (__unused NSException *e) {}
     return orig_wvInit(self, _cmd, frame, config);
 }
 
-static void (*orig_setUCC)(id, SEL, id);
-static void hook_setUCC(id self, SEL _cmd, id ucc) {
-    orig_setUCC(self, _cmd, ucc);
-    @try {
-        if (ucc) {
-            WKUserScript *s = [[WKUserScript alloc] initWithSource:DandanJS()
-                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                                  forMainFrameOnly:NO];
-            [ucc addUserScript:s];
-            DLog(@"[WKWebView] 已注入 userScript(setUserContentController)");
-        }
-    } @catch (__unused NSException *e) {}
+static id (*orig_wvLoadRequest)(id, SEL, NSURLRequest *);
+static id hook_wvLoadRequest(id self, SEL _cmd, NSURLRequest *req) {
+    DLog(@"[WKWebView] loadRequest: %@", req.URL.absoluteString);
+    @try { dandanAddScript([(WKWebView *)self configuration]); } @catch (__unused NSException *e) {}
+    return orig_wvLoadRequest(self, _cmd, req);
 }
 
-// ================= 原生网络 hook（保留，兜底） =================
+// ================= 原生网络 hook（兜底） =================
 static NSDictionary *VIP_PATCH(void) {
     return @{
         @"vip_status":    @YES,
@@ -200,13 +211,18 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         Method mi = class_getInstanceMethod(wv, @selector(initWithFrame:configuration:));
         if (mi) { orig_wvInit = (id(*)(id,SEL,CGRect,id))method_getImplementation(mi);
                   method_setImplementation(mi, (IMP)hook_wvInit); }
+        Method ml = class_getInstanceMethod(wv, @selector(loadRequest:));
+        if (ml) { orig_wvLoadRequest = (id(*)(id,SEL,id))method_getImplementation(ml);
+                  method_setImplementation(ml, (IMP)hook_wvLoadRequest); }
     }
     Class wvc = objc_getClass("WKWebViewConfiguration");
     if (wvc) {
-        Method ms = class_getInstanceMethod(wvc, @selector(setUserContentController:));
-        if (ms) { orig_setUCC = (void(*)(id,SEL,id))method_getImplementation(ms);
-                  method_setImplementation(ms, (IMP)hook_setUCC); }
+        Method mg = class_getInstanceMethod(wvc, @selector(userContentController));
+        if (mg) { orig_uccGetter = (id(*)(id,SEL))method_getImplementation(mg);
+                  method_setImplementation(mg, (IMP)hook_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v3 已加载 (WKWebView=%s) ===", wv ? "yes" : "no");
+    DLog(@"=== dandan_unlock v4 已加载 (WKWebView=%s, Flutter=%s) ===",
+         wv ? "yes" : "no",
+         (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no");
 }
