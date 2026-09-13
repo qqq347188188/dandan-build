@@ -56,7 +56,7 @@ static int fbt_prepend(struct fbt_rebinding rb[], size_t n) {
     return 0;
 }
 
-static void fbt_section(struct fbt_entry *rebindings, fbt_section *sect,
+static void fbt_do_section(struct fbt_entry *rebindings, fbt_section *sect,
                         intptr_t slide, fbt_nlist *symtab, char *strtab, uint32_t *indirect) {
     uint32_t *idx = indirect + sect->reserved1;
     void **bind = (void **)((uintptr_t)slide + sect->addr);
@@ -111,16 +111,21 @@ static void fbt_image(struct fbt_entry *rb, const struct mach_header *h, intptr_
             fbt_section *s = (fbt_section *)(p + sizeof(fbt_segment_command)) + j;
             if ((s->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
                 (s->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                fbt_section(rb, s, slide, symtab, strtab, indirect);
+                fbt_do_section(rb, s, slide, symtab, strtab, indirect);
             }
         }
     }
 }
 
+// dyld 回调只接受 (const mach_header*, intptr_t) 两个参数，这里包一层
+static void fbt_image_cb(const struct mach_header *h, intptr_t slide) {
+    fbt_image(fbt_head, h, slide);
+}
+
 static int fbt_rebind(struct fbt_rebinding rb[], size_t n) {
     if (fbt_prepend(rb, n) < 0) return -1;
     if (!fbt_head->next) {
-        _dyld_register_func_for_add_image(fbt_image);
+        _dyld_register_func_for_add_image(fbt_image_cb);
     } else {
         for (uint32_t i = 0; i < _dyld_image_count(); i++)
             fbt_image(fbt_head, _dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
