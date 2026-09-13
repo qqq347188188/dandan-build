@@ -453,6 +453,21 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
     return r;
 }
 
+// 就地等长改写：只改 vip_status/vip_level，字节数完全不变（缓冲区不够时用）
+static int patch_inplace(unsigned char *buf, size_t len) {
+    int changed = 0;
+    static const char P1[] = "\"vip_status\":false";
+    static const char R1[] = "\"vip_status\":true ";
+    static const char P2[] = "\"vip_level\":0";
+    static const char R2[] = "\"vip_level\":3";
+    const size_t L1 = sizeof(P1) - 1, L2 = sizeof(P2) - 1;
+    for (size_t i = 0; i + L1 <= len; i++)
+        if (memcmp(buf + i, P1, L1) == 0) { memcpy(buf + i, R1, L1); changed = 1; i += L1 - 1; }
+    for (size_t i = 0; i + L2 <= len; i++)
+        if (memcmp(buf + i, P2, L2) == 0) { memcpy(buf + i, R2, L2); changed = 1; i += L2 - 1; }
+    return changed;
+}
+
 // 在 data 里做字节替换（长度可变），返回是否改动过
 static BOOL replace_in_data(NSMutableData *d, const char *pat, const char *rep) {
     size_t pl = strlen(pat), rl = strlen(rep);
@@ -557,15 +572,25 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
     r = o_read(fd, buf, count);
     if (r <= 0) { g_inside = 0; return r; }
 
-    // 必须是完整响应才改写
+    // 必须是完整响应才处理
     if (!response_complete((const unsigned char *)buf, (size_t)r)) { g_inside = 0; return r; }
     NSData *raw = [NSData dataWithBytesNoCopy:buf length:(size_t)r freeWhenDone:NO];
     NSData *out = patch_response(raw);
-    DLog(@"[socket] 响应 fd=%d len=%ld 改写=%d", fd, (long)r, out != nil ? 1 : 0);
-    if (!out || out.length > count) { g_inside = 0; return r; }   // 没命中/放不下就原样返回
-    memcpy(buf, out.bytes, out.length);
+    if (out && out.length <= count) {
+        memcpy(buf, out.bytes, out.length);
+        DLog(@"[socket] 响应改写(完整) fd=%d %ld -> %ld", fd, (long)r, (long)out.length);
+        g_inside = 0;
+        return (ssize_t)out.length;
+    }
+    // 缓冲区装不下改写后的长度：退化为就地等长改写（至少改 vip_status/vip_level）
+    if (out) {
+        int hit = patch_inplace((unsigned char *)buf, (size_t)r);
+        DLog(@"[socket] 响应改写(就地) fd=%d r=%ld count=%lu hit=%d", fd, (long)r, (unsigned long)count, hit);
+    } else {
+        DLog(@"[socket] 响应 fd=%d r=%ld count=%lu 未命中", fd, (long)r, (unsigned long)count);
+    }
     g_inside = 0;
-    return (ssize_t)out.length;
+    return r;
 }
 
 // ============================ 入口 ============================
@@ -595,7 +620,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v19 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v20 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
