@@ -13,6 +13,8 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <WebKit/WebKit.h>
 #include <stdarg.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -334,23 +336,74 @@ static ssize_t(*o_write)(int, const void *, size_t);
 static const char *TARGET_IP = "38.76.202.248";
 static const int   TARGET_PORT = 8000;
 
+// ============================ WKWebView 注入（对付 H5 壳） ============================
+static NSString *DandanJS(void) {
+    static NSString *js; static dispatch_once_t o;
+    dispatch_once(&o, ^{
+        js = @"(function(){if(window.__dandan){return;}window.__dandan=1;try{var P={vip_status:true,vip_level:3,vip_expire_at:'2099-09-19T22:21:06.147807+00:00'};function T(u){return typeof u==='string'&&(u.indexOf('38.76.202.248')>-1||u.indexOf('/profiles')>-1);}function patch(t){try{var j=JSON.parse(t);var p=function(o){if(o&&typeof o==='object'){Object.assign(o,P);}};if(Array.isArray(j)){j.forEach(p);}else{p(j);}return JSON.stringify(j);}catch(e){return t;}}var of=window.fetch;if(of){window.fetch=function(i,n){var u=(typeof i==='string')?i:((i&&i.url)||'');return of.apply(this,arguments).then(function(r){if(!T(u)){return r;}return r.clone().text().then(function(t){var b=patch(t);var h=new Headers(r.headers);h.delete('content-length');return new Response(b,{status:r.status,statusText:r.statusText,headers:h});}).catch(function(){return r;});});};}var oo=XMLHttpRequest.prototype.open;var os=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){this.__du=u;return oo.apply(this,arguments);};XMLHttpRequest.prototype.send=function(){var x=this;x.addEventListener('readystatechange',function(){if(x.readyState===4&&T(x.__du)){try{var b=patch(x.responseText);Object.defineProperty(x,'responseText',{configurable:true,get:function(){return b;}});}catch(e){}}});return os.apply(this,arguments);};}catch(e){}})();";
+    });
+    return js;
+}
+
+static const void *kDandanKey = &kDandanKey;
+
+static void dandanAttach(WKUserContentController *ucc) {
+    if (!ucc) return;
+    if (objc_getAssociatedObject(ucc, kDandanKey)) return;
+    objc_setAssociatedObject(ucc, kDandanKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    WKUserScript *s = [[WKUserScript alloc] initWithSource:DandanJS()
+                                             injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                          forMainFrameOnly:NO];
+    [ucc addUserScript:s];
+    DLog(@"[WKWebView] 已注入 userScript");
+}
+
+static void dandanAddConfig(WKWebViewConfiguration *config) {
+    if (!config) return;
+    WKUserContentController *ucc = config.userContentController;
+    if (!ucc) { ucc = [[WKUserContentController alloc] init]; config.userContentController = ucc; }
+    dandanAttach(ucc);
+}
+
+static id (*o_uccGetter)(id, SEL);
+static id my_uccGetter(id self, SEL _cmd) {
+    id ucc = o_uccGetter(self, _cmd);
+    @try { dandanAttach(ucc); } @catch (__unused NSException *e) {}
+    return ucc;
+}
+
+static id (*o_wvInit)(id, SEL, CGRect, id);
+static id my_wvInit(id self, SEL _cmd, CGRect frame, id config) {
+    DLog(@"[WKWebView] initWithFrame:configuration:");
+    @try { dandanAddConfig(config); } @catch (__unused NSException *e) {}
+    return o_wvInit(self, _cmd, frame, config);
+}
+
+static id (*o_wvLoad)(id, SEL, NSURLRequest *);
+static id my_wvLoad(id self, SEL _cmd, NSURLRequest *req) {
+    DLog(@"[WKWebView] loadRequest: %@", req.URL.absoluteString);
+    @try { dandanAddConfig([(WKWebView *)self configuration]); } @catch (__unused NSException *e) {}
+    return o_wvLoad(self, _cmd, req);
+}
+
 // ============================ Hooks ============================
 static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
     if (g_inside || !o_connect) return o_connect(fd, addr, al);
     g_inside = 1;
     int r = o_connect(fd, addr, al);
-    if (r == 0 && addr && addr->sa_family == AF_INET && fd >= 0 && fd < MAXFD) {
+    if (r == 0 && addr && addr->sa_family == AF_INET) {
         const struct sockaddr_in *s = (const struct sockaddr_in *)addr;
-        if (ntohs(s->sin_port) == TARGET_PORT) {
-            char ip[INET_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
-            if (strcmp(ip, TARGET_IP) == 0) {
-                pthread_mutex_lock(&g_lock);
-                conn_reset(&g_conn[fd]);
-                g_conn[fd].tracked = 1; g_conn[fd].patch = 0;
-                pthread_mutex_unlock(&g_lock);
-                DLog(@"[socket] 命中目标连接 fd=%d %s:%d", fd, ip, TARGET_PORT);
-            }
+        int port = ntohs(s->sin_port);
+        char ip[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
+        if (port == TARGET_PORT && strcmp(ip, TARGET_IP) == 0 && fd >= 0 && fd < MAXFD) {
+            pthread_mutex_lock(&g_lock);
+            conn_reset(&g_conn[fd]);
+            g_conn[fd].tracked = 1; g_conn[fd].patch = 0;
+            pthread_mutex_unlock(&g_lock);
+            DLog(@"[socket] 命中目标连接 fd=%d %s:%d", fd, ip, TARGET_PORT);
+        } else if (port == 80 || port == 443 || port == 8080) {
+            DLog(@"[socket] connect %s:%d", ip, port);
         }
     }
     g_inside = 0;
@@ -459,6 +512,20 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
     };
     int ret = fbt_rebind(rb, sizeof(rb) / sizeof(rb[0]));
 
-    DLog(@"=== dandan_unlock v7 已加载 (rebind=%d, Flutter=%s) ===", ret,
-         (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no");
+    Class wv = objc_getClass("WKWebView");
+    if (wv) {
+        Method mi = class_getInstanceMethod(wv, @selector(initWithFrame:configuration:));
+        if (mi) { o_wvInit = (id(*)(id,SEL,CGRect,id))method_getImplementation(mi); method_setImplementation(mi, (IMP)my_wvInit); }
+        Method ml = class_getInstanceMethod(wv, @selector(loadRequest:));
+        if (ml) { o_wvLoad = (id(*)(id,SEL,id))method_getImplementation(ml); method_setImplementation(ml, (IMP)my_wvLoad); }
+    }
+    Class wvc = objc_getClass("WKWebViewConfiguration");
+    if (wvc) {
+        Method mg = class_getInstanceMethod(wvc, @selector(userContentController));
+        if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
+    }
+
+    DLog(@"=== dandan_unlock v8 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+         (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
+         wv ? "yes" : "no");
 }
