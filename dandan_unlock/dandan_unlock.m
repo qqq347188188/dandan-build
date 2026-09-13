@@ -441,16 +441,76 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
     ssize_t r;
     if (1) {
         int isProfile = fb_memmem(buf, len, "profiles", 8) ? 1 : 0;
-        NSData *nb = rewrite_request(buf, len);
         pthread_mutex_lock(&g_lock);
         if (fd >= 0 && fd < MAXFD) { conn_reset(&g_conn[fd]); g_conn[fd].tracked = 1; g_conn[fd].patch = isProfile; }
         pthread_mutex_unlock(&g_lock);
-        r = o_write(fd, nb.bytes, nb.length);
+        // v17 诊断：完全不改写请求（排除请求侧影响）
+        r = o_write(fd, buf, len);
     } else {
         r = o_write(fd, buf, len);
     }
     g_inside = 0;
     return r;
+}
+
+// 在 data 里做字节替换（长度可变），返回是否改动过
+static BOOL replace_in_data(NSMutableData *d, const char *pat, const char *rep) {
+    size_t pl = strlen(pat), rl = strlen(rep);
+    if (!pl) return NO;
+    BOOL changed = NO;
+    size_t start = 0;
+    for (;;) {
+        const unsigned char *b = (const unsigned char *)d.bytes;
+        size_t len = d.length;
+        if (start + pl > len) break;
+        const unsigned char *q = (const unsigned char *)fb_memmem(b + start, len - start, pat, pl);
+        if (!q) break;
+        size_t idx = (size_t)(q - b);
+        [d replaceBytesInRange:NSMakeRange(idx, pl) withBytes:rep length:rl];
+        changed = YES;
+        start = idx + rl;
+    }
+    return changed;
+}
+
+// 对完整响应做「原样 JSON 字段替换」（保序、不重新转义），并同步 Content-Length
+static NSData *patch_response(NSData *raw) {
+    const unsigned char *b = (const unsigned char *)raw.bytes;
+    size_t len = raw.length;
+    const unsigned char *p = (const unsigned char *)fb_memmem(b, len, "\r\n\r\n", 4);
+    if (!p) return nil;
+    size_t hdrEnd = (size_t)(p - b) + 4;
+    if (hdrEnd > len) return nil;
+    if (fb_memmem(b, hdrEnd, "chunked", 7)) return nil;
+
+    NSMutableData *nb = [NSMutableData dataWithBytes:(b + hdrEnd) length:(len - hdrEnd)];
+    BOOL changed = NO;
+    changed |= replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
+    changed |= replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
+    changed |= replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
+    if (!changed) return nil;
+
+    NSString *hs = [[NSString alloc] initWithData:[NSData dataWithBytes:b length:hdrEnd] encoding:NSISOLatin1StringEncoding];
+    if (!hs) return nil;
+    NSArray *src = [hs componentsSeparatedByString:@"\r\n"];
+    NSMutableArray *lines = [NSMutableArray array];
+    BOOL rep = NO;
+    for (NSUInteger i = 0; i < src.count; i++) {
+        NSString *l = src[i];
+        if ([l.lowercaseString hasPrefix:@"content-length:"]) {
+            [lines addObject:[NSString stringWithFormat:@"Content-Length: %lu", (unsigned long)nb.length]];
+            rep = YES;
+            continue;
+        }
+        [lines addObject:l];
+    }
+    if (!rep && lines.count > 0)
+        [lines insertObject:[NSString stringWithFormat:@"Content-Length: %lu", (unsigned long)nb.length] atIndex:lines.count - 1];
+
+    NSMutableData *out = [NSMutableData data];
+    [out appendData:[[lines componentsJoinedByString:@"\r\n"] dataUsingEncoding:NSISOLatin1StringEncoding]];
+    [out appendData:nb];
+    return out;
 }
 
 static ssize_t my_read(int fd, void *buf, size_t count) {
@@ -480,36 +540,15 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
     r = o_read(fd, buf, count);
     if (r <= 0) { g_inside = 0; return r; }
 
-    // 只有本次读到的是一个完整响应才改写，否则原样放过
-    if (!response_complete((const unsigned char *)buf, (size_t)r)) {
-        g_inside = 0;
-        return r;
-    }
-
+    // 必须是完整响应才改写
+    if (!response_complete((const unsigned char *)buf, (size_t)r)) { g_inside = 0; return r; }
     NSData *raw = [NSData dataWithBytesNoCopy:buf length:(size_t)r freeWhenDone:NO];
-    NSData *out = patched_response(raw);
-    if (out == raw) { g_inside = 0; return r; }   // 没能改写，原样返回
-
-    size_t ol = out.length;
-    DLog(@"[socket] 响应改写 fd=%d %lu -> %lu", fd, (unsigned long)r, (unsigned long)ol);
-    if (ol <= count) {
-        memcpy(buf, out.bytes, ol);
-        g_inside = 0;
-        return (ssize_t)ol;
-    }
-    // 变长了：超出的部分暂存，下次 read 再给
-    memcpy(buf, out.bytes, count);
-    pthread_mutex_lock(&g_lock);
-    Conn *c2 = &g_conn[fd];
-    if (c2->out) free(c2->out);
-    c2->out = (unsigned char *)malloc(ol - count);
-    if (c2->out) {
-        memcpy(c2->out, (const unsigned char *)out.bytes + count, ol - count);
-        c2->outLen = ol - count; c2->outPos = 0;
-    } else { c2->outLen = c2->outPos = 0; }
-    pthread_mutex_unlock(&g_lock);
+    NSData *out = patch_response(raw);
+    DLog(@"[socket] 响应 fd=%d len=%ld 改写=%d", fd, (long)r, out != nil ? 1 : 0);
+    if (!out || out.length > count) { g_inside = 0; return r; }   // 没命中/放不下就原样返回
+    memcpy(buf, out.bytes, out.length);
     g_inside = 0;
-    return (ssize_t)count;
+    return (ssize_t)out.length;
 }
 
 // ============================ 入口 ============================
@@ -539,7 +578,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v15 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v18 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
