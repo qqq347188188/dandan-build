@@ -1,12 +1,15 @@
 //
-//  dandan_unlock.m  (v5)
-//  蛋蛋不语 VIP 解锁 dylib —— Flutter 套壳版（socket 层拦截）
+//  dandan_unlock.m  (v6)
+//  蛋蛋不语 VIP 解锁 dylib —— Flutter 套壳版（socket 层，非阻塞安全版）
 //
-//  结论：App 是 Flutter，网络走 dart:io 的 BSD socket，NSURLSession 完全看不到。
-//  方案：用 fishhook 勾住 connect / write / read，对 38.76.202.248:8000 的连接：
-//        - 发请求时：把 HTTP/1.1 改成 HTTP/1.0（避免 chunked/keep-alive），
-//                    把 Accept-Encoding 改成 identity（避免 gzip，方便改 body）；
-//        - 收响应时：把整个响应攒齐，解析 JSON，注入 VIP 字段，改 Content-Length 后交给 App。
+//  目标：http://38.76.202.248:8000//rest/v1/profiles?select=*&id=eq.<uuid>
+//  做法：fishhook 勾住 connect / write / read。
+//        - connect 到 38.76.202.248:8000 的 socket 打标记；
+//        - write 时改写请求：HTTP/1.1 -> HTTP/1.0（避免 chunked/长连接），
+//          Accept-Encoding -> identity（避免 gzip）；
+//        - read 时：只处理"本次读到的就是一个完整响应"的情况，就地改写后返回；
+//          不完整则原样返回（不影响 App 正常联网）。
+//        全程不阻塞、不攒包，最大限度避免卡线程/闪退。
 //
 
 #import <Foundation/Foundation.h>
@@ -15,7 +18,6 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +44,6 @@ typedef struct nlist              fbt_nlist;
 #endif
 
 struct fbt_rebinding { const char *name; void *replacement; void **replaced; };
-
 struct fbt_entry { struct fbt_rebinding *r; size_t n; struct fbt_entry *next; };
 static struct fbt_entry *fbt_head;
 
@@ -56,8 +57,8 @@ static int fbt_prepend(struct fbt_rebinding rb[], size_t n) {
     return 0;
 }
 
-static void fbt_do_section(struct fbt_entry *rebindings, fbt_section *sect,
-                        intptr_t slide, fbt_nlist *symtab, char *strtab, uint32_t *indirect) {
+static void fbt_do_section(struct fbt_entry *rb, fbt_section *sect,
+                           intptr_t slide, fbt_nlist *symtab, char *strtab, uint32_t *indirect) {
     uint32_t *idx = indirect + sect->reserved1;
     void **bind = (void **)((uintptr_t)slide + sect->addr);
     for (uint32_t i = 0; i < sect->size / sizeof(void *); i++) {
@@ -67,7 +68,7 @@ static void fbt_do_section(struct fbt_entry *rebindings, fbt_section *sect,
         uint32_t off = symtab[si].n_un.n_strx;
         char *name = strtab + off;
         if (strnlen(name, 2) < 2) continue;
-        for (struct fbt_entry *cur = rebindings; cur; cur = cur->next) {
+        for (struct fbt_entry *cur = rb; cur; cur = cur->next) {
             for (size_t j = 0; j < cur->n; j++) {
                 if (strcmp(&name[1], cur->r[j].name) == 0) {
                     if (cur->r[j].replaced && bind[i] != cur->r[j].replacement)
@@ -117,7 +118,6 @@ static void fbt_image(struct fbt_entry *rb, const struct mach_header *h, intptr_
     }
 }
 
-// dyld 回调只接受 (const mach_header*, intptr_t) 两个参数，这里包一层
 static void fbt_image_cb(const struct mach_header *h, intptr_t slide) {
     fbt_image(fbt_head, h, slide);
 }
@@ -208,9 +208,11 @@ static int response_complete(const unsigned char *b, size_t len) {
 static NSData *patched_response(NSData *raw) {
     const unsigned char *b = (const unsigned char *)raw.bytes;
     size_t len = raw.length;
+    if (len < 4) return raw;
     const unsigned char *p = (const unsigned char *)fb_memmem(b, len, "\r\n\r\n", 4);
     if (!p) return raw;
     size_t hdrEnd = (size_t)(p - b) + 4;
+    if (hdrEnd > len) return raw;
     if (fb_memmem(b, hdrEnd, "chunked", 7)) return raw;
 
     NSData *body = [NSData dataWithBytes:(b + hdrEnd) length:(len - hdrEnd)];
@@ -228,10 +230,11 @@ static NSData *patched_response(NSData *raw) {
         [(NSMutableDictionary *)json addEntriesFromDictionary:P];
     }
     NSData *nb = [NSJSONSerialization dataWithJSONObject:json options:0 error:&e];
-    if (!nb) return raw;
+    if (!nb || nb.length == 0) return raw;
 
     NSString *hs = [[NSString alloc] initWithData:[NSData dataWithBytes:b length:hdrEnd]
                                          encoding:NSISOLatin1StringEncoding];
+    if (!hs) return raw;
     NSMutableArray *lines = [[hs componentsSeparatedByString:@"\r\n"] mutableCopy];
     BOOL rep = NO;
     for (NSUInteger i = 0; i < lines.count; i++) {
@@ -252,6 +255,7 @@ static NSData *patched_response(NSData *raw) {
 
 // ============================ 请求改写 ============================
 static NSData *rewrite_request(const void *buf, size_t len) {
+    if (!buf || len == 0) return [NSData data];
     const unsigned char *b = (const unsigned char *)buf;
     static const char *key = "accept-encoding:";
     const size_t keyLen = 16;
@@ -276,7 +280,6 @@ static NSData *rewrite_request(const void *buf, size_t len) {
     } else {
         m = [NSMutableData dataWithBytes:buf length:len];
     }
-    // HTTP/1.1 -> HTTP/1.0（等长替换）
     unsigned char *mb = (unsigned char *)m.mutableBytes;
     size_t n = m.length, off = 0;
     while (off + 8 <= n) {
@@ -291,43 +294,43 @@ static NSData *rewrite_request(const void *buf, size_t len) {
 
 // ============================ 连接状态 ============================
 #define MAXFD 4096
-typedef struct { int tracked, patch; unsigned char *acc; size_t accLen;
-                 unsigned char *out; size_t outLen, outPos; int finished, eof; } Conn;
+typedef struct {
+    int tracked;         // 连到目标服务器
+    int patch;           // 当前请求是 profiles
+    unsigned char *out;  // 改写后变长、暂存的剩余字节
+    size_t outLen, outPos;
+} Conn;
 static Conn g_conn[MAXFD];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int g_inside = 0;
 
 static void conn_reset(Conn *c) {
-    if (c->acc) { free(c->acc); c->acc = NULL; }
     if (c->out) { free(c->out); c->out = NULL; }
-    c->accLen = c->outLen = c->outPos = 0; c->finished = c->eof = 0;
+    c->outLen = c->outPos = 0;
 }
 
 // ============================ 原函数指针 ============================
 static int    (*o_connect)(int, const struct sockaddr *, socklen_t);
 static ssize_t(*o_read)(int, void *, size_t);
-static ssize_t(*o_recv)(int, void *, size_t, int);
 static ssize_t(*o_write)(int, const void *, size_t);
-static ssize_t(*o_send)(int, const void *, size_t, int);
-static int    (*o_close)(int);
 
 static const char *TARGET_IP = "38.76.202.248";
 static const int   TARGET_PORT = 8000;
 
 // ============================ Hooks ============================
 static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
-    if (!o_connect) o_connect = (int(*)(int,const struct sockaddr*,socklen_t))dlsym(RTLD_DEFAULT, "connect");
-    if (g_inside) return o_connect(fd, addr, al);
+    if (g_inside || !o_connect) return o_connect(fd, addr, al);
     g_inside = 1;
     int r = o_connect(fd, addr, al);
-    if (r == 0 && addr && addr->sa_family == AF_INET) {
+    if (r == 0 && addr && addr->sa_family == AF_INET && fd >= 0 && fd < MAXFD) {
         const struct sockaddr_in *s = (const struct sockaddr_in *)addr;
         if (ntohs(s->sin_port) == TARGET_PORT) {
             char ip[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
-            if (strcmp(ip, TARGET_IP) == 0 && fd >= 0 && fd < MAXFD) {
+            if (strcmp(ip, TARGET_IP) == 0) {
                 pthread_mutex_lock(&g_lock);
-                conn_reset(&g_conn[fd]); g_conn[fd].tracked = 1;
+                conn_reset(&g_conn[fd]);
+                g_conn[fd].tracked = 1; g_conn[fd].patch = 0;
                 pthread_mutex_unlock(&g_lock);
                 DLog(@"[socket] 命中目标连接 fd=%d %s:%d", fd, ip, TARGET_PORT);
             }
@@ -337,165 +340,108 @@ static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
     return r;
 }
 
-static ssize_t my_write_common(int fd, const void *buf, size_t len) {
+static ssize_t my_write(int fd, const void *buf, size_t len) {
+    if (g_inside || !o_write) return o_write(fd, buf, len);
+    g_inside = 1;
     int tracked = 0;
     pthread_mutex_lock(&g_lock);
     if (fd >= 0 && fd < MAXFD) tracked = g_conn[fd].tracked;
     pthread_mutex_unlock(&g_lock);
-    if (!tracked || !buf || !len) return o_write(fd, buf, len);
 
-    int isProfile = fb_memmem(buf, len, "profiles", 8) ? 1 : 0;
-    NSData *nb = rewrite_request(buf, len);
-    pthread_mutex_lock(&g_lock);
-    if (fd >= 0 && fd < MAXFD) { conn_reset(&g_conn[fd]); g_conn[fd].tracked = 1; g_conn[fd].patch = isProfile; }
-    pthread_mutex_unlock(&g_lock);
-    DLog(@"[socket] 请求 fd=%d len=%lu profiles=%d", fd, (unsigned long)len, isProfile);
-    return o_write(fd, nb.bytes, nb.length);
-}
-
-static ssize_t my_write(int fd, const void *buf, size_t len) {
-    if (!o_write) o_write = (ssize_t(*)(int,const void*,size_t))dlsym(RTLD_DEFAULT, "write");
-    if (g_inside) return o_write(fd, buf, len);
-    g_inside = 1;
-    ssize_t r = my_write_common(fd, buf, len);
-    g_inside = 0;
-    return r;
-}
-static ssize_t my_send(int fd, const void *buf, size_t len, int flags) {
-    if (!o_send) o_send = (ssize_t(*)(int,const void*,size_t,int))dlsym(RTLD_DEFAULT, "send");
-    if (g_inside) return o_send(fd, buf, len, flags);
-    g_inside = 1;
-    // 复用 write 逻辑（flags 一般为 0）
     ssize_t r;
-    if (!o_write) o_write = (ssize_t(*)(int,const void*,size_t))dlsym(RTLD_DEFAULT, "write");
-    r = my_write_common(fd, buf, len);
+    if (tracked && buf && len) {
+        int isProfile = fb_memmem(buf, len, "profiles", 8) ? 1 : 0;
+        NSData *nb = rewrite_request(buf, len);
+        pthread_mutex_lock(&g_lock);
+        if (fd >= 0 && fd < MAXFD) { conn_reset(&g_conn[fd]); g_conn[fd].tracked = 1; g_conn[fd].patch = isProfile; }
+        pthread_mutex_unlock(&g_lock);
+        DLog(@"[socket] 请求 fd=%d len=%lu profiles=%d", fd, (unsigned long)len, isProfile);
+        r = o_write(fd, nb.bytes, nb.length);
+    } else {
+        r = o_write(fd, buf, len);
+    }
     g_inside = 0;
     return r;
 }
 
-static ssize_t my_read_common(int fd, void *buf, size_t count) {
+static ssize_t my_read(int fd, void *buf, size_t count) {
+    if (g_inside || !o_read) return o_read(fd, buf, count);
+    g_inside = 1;
+
     int tracked = 0, patch = 0;
     pthread_mutex_lock(&g_lock);
     if (fd >= 0 && fd < MAXFD) { tracked = g_conn[fd].tracked; patch = g_conn[fd].patch; }
     pthread_mutex_unlock(&g_lock);
-    if (!tracked || !patch) return o_read(fd, buf, count);
 
-    // 有已处理好的数据就先吐
+    ssize_t r;
+    if (!tracked || !patch || !buf || count == 0) {
+        r = o_read(fd, buf, count);
+        g_inside = 0;
+        return r;
+    }
+
+    // 先吐上次没吐完的
     pthread_mutex_lock(&g_lock);
     Conn *c = &g_conn[fd];
-    if (c->finished && c->out) {
-        if (c->outPos < c->outLen) {
-            size_t n = c->outLen - c->outPos; if (n > count) n = count;
-            memcpy(buf, c->out + c->outPos, n); c->outPos += n;
-            pthread_mutex_unlock(&g_lock);
-            return (ssize_t)n;
-        }
-        int e = c->eof;
+    if (c->out && c->outPos < c->outLen) {
+        size_t n = c->outLen - c->outPos; if (n > count) n = count;
+        memcpy(buf, c->out + c->outPos, n); c->outPos += n;
+        if (c->outPos >= c->outLen) { free(c->out); c->out = NULL; c->outLen = c->outPos = 0; }
         pthread_mutex_unlock(&g_lock);
-        if (e) return 0;
-        pthread_mutex_lock(&g_lock); conn_reset(c); c->tracked = 1; c->patch = patch;
-        pthread_mutex_unlock(&g_lock);
-        return o_read(fd, buf, count);
+        g_inside = 0;
+        return (ssize_t)n;
     }
     pthread_mutex_unlock(&g_lock);
 
-    // 攒齐整个响应
-    unsigned char tmp[8192];
-    int waited = 0;
-    for (;;) {
-        ssize_t n = o_read(fd, tmp, sizeof(tmp));
-        if (n > 0) {
-            pthread_mutex_lock(&g_lock);
-            Conn *cc = &g_conn[fd];
-            cc->acc = (unsigned char *)realloc(cc->acc, cc->accLen + (size_t)n);
-            memcpy(cc->acc + cc->accLen, tmp, (size_t)n);
-            cc->accLen += (size_t)n;
-            int done = response_complete(cc->acc, cc->accLen);
-            pthread_mutex_unlock(&g_lock);
-            if (done) break;
-            continue;
-        }
-        if (n == 0) {
-            pthread_mutex_lock(&g_lock); g_conn[fd].eof = 1; pthread_mutex_unlock(&g_lock);
-            break;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            struct pollfd pf; pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
-            int pr = poll(&pf, 1, 100);
-            if (pr == 0) { waited += 100; if (waited > 3000) break; }
-            else if (pr < 0) break;
-            continue;
-        }
-        break;
+    // 只读一次，不阻塞
+    r = o_read(fd, buf, count);
+    if (r <= 0) { g_inside = 0; return r; }
+
+    // 只有本次读到的是一个完整响应才改写，否则原样放过
+    if (!response_complete((const unsigned char *)buf, (size_t)r)) {
+        g_inside = 0;
+        return r;
     }
 
+    NSData *raw = [NSData dataWithBytesNoCopy:buf length:(size_t)r freeWhenDone:NO];
+    NSData *out = patched_response(raw);
+    if (out == raw) { g_inside = 0; return r; }   // 没能改写，原样返回
+
+    size_t ol = out.length;
+    DLog(@"[socket] 响应改写 fd=%d %lu -> %lu", fd, (unsigned long)r, (unsigned long)ol);
+    if (ol <= count) {
+        memcpy(buf, out.bytes, ol);
+        g_inside = 0;
+        return (ssize_t)ol;
+    }
+    // 变长了：超出的部分暂存，下次 read 再给
+    memcpy(buf, out.bytes, count);
     pthread_mutex_lock(&g_lock);
     Conn *c2 = &g_conn[fd];
-    NSData *raw = [NSData dataWithBytes:c2->acc length:c2->accLen];
-    NSData *out = patched_response(raw);
-    c2->out = (unsigned char *)malloc(out.length);
-    memcpy(c2->out, out.bytes, out.length);
-    c2->outLen = out.length; c2->outPos = 0; c2->finished = 1;
-    BOOL did = (out != raw);
+    if (c2->out) free(c2->out);
+    c2->out = (unsigned char *)malloc(ol - count);
+    if (c2->out) {
+        memcpy(c2->out, (const unsigned char *)out.bytes + count, ol - count);
+        c2->outLen = ol - count; c2->outPos = 0;
+    } else { c2->outLen = c2->outPos = 0; }
     pthread_mutex_unlock(&g_lock);
-    DLog(@"[socket] 响应 fd=%d 原=%lu 新=%lu patched=%d", fd,
-         (unsigned long)raw.length, (unsigned long)out.length, did);
-
-    pthread_mutex_lock(&g_lock);
-    Conn *c3 = &g_conn[fd];
-    size_t n = c3->outLen - c3->outPos; if (n > count) n = count;
-    if (n) memcpy(buf, c3->out + c3->outPos, n);
-    c3->outPos += n;
-    pthread_mutex_unlock(&g_lock);
-    return (ssize_t)n;
-}
-
-static ssize_t my_read(int fd, void *buf, size_t count) {
-    if (!o_read) o_read = (ssize_t(*)(int,void*,size_t))dlsym(RTLD_DEFAULT, "read");
-    if (g_inside) return o_read(fd, buf, count);
-    g_inside = 1;
-    ssize_t r = my_read_common(fd, buf, count);
     g_inside = 0;
-    return r;
-}
-static ssize_t my_recv(int fd, void *buf, size_t count, int flags) {
-    if (!o_recv) o_recv = (ssize_t(*)(int,void*,size_t,int))dlsym(RTLD_DEFAULT, "recv");
-    if (g_inside) return o_recv(fd, buf, count, flags);
-    g_inside = 1;
-    ssize_t r = my_read_common(fd, buf, count);
-    g_inside = 0;
-    return r;
-}
-
-static int my_close(int fd) {
-    if (!o_close) o_close = (int(*)(int))dlsym(RTLD_DEFAULT, "close");
-    if (g_inside) return o_close(fd);
-    g_inside = 1;
-    if (fd >= 0 && fd < MAXFD) { pthread_mutex_lock(&g_lock); conn_reset(&g_conn[fd]); pthread_mutex_unlock(&g_lock); }
-    int r = o_close(fd);
-    g_inside = 0;
-    return r;
+    return (ssize_t)count;
 }
 
 // ============================ 入口 ============================
 __attribute__((constructor)) static void dandan_unlock_init(void) {
     o_connect = (int(*)(int,const struct sockaddr*,socklen_t))dlsym(RTLD_DEFAULT, "connect");
     o_read    = (ssize_t(*)(int,void*,size_t))dlsym(RTLD_DEFAULT, "read");
-    o_recv    = (ssize_t(*)(int,void*,size_t,int))dlsym(RTLD_DEFAULT, "recv");
     o_write   = (ssize_t(*)(int,const void*,size_t))dlsym(RTLD_DEFAULT, "write");
-    o_send    = (ssize_t(*)(int,const void*,size_t,int))dlsym(RTLD_DEFAULT, "send");
-    o_close   = (int(*)(int))dlsym(RTLD_DEFAULT, "close");
 
     struct fbt_rebinding rb[] = {
         { "connect", (void *)my_connect, (void **)&o_connect },
         { "read",    (void *)my_read,    (void **)&o_read },
-        { "recv",    (void *)my_recv,    (void **)&o_recv },
         { "write",   (void *)my_write,   (void **)&o_write },
-        { "send",    (void *)my_send,    (void **)&o_send },
-        { "close",   (void *)my_close,   (void **)&o_close },
     };
     int ret = fbt_rebind(rb, sizeof(rb) / sizeof(rb[0]));
 
-    DLog(@"=== dandan_unlock v5 已加载 (socket hook ret=%d, Flutter=%s) ===", ret,
+    DLog(@"=== dandan_unlock v6 已加载 (rebind=%d, Flutter=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no");
 }
