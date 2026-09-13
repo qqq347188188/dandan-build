@@ -473,6 +473,21 @@ static BOOL replace_in_data(NSMutableData *d, const char *pat, const char *rep) 
     return changed;
 }
 
+// 替换 JSON 字符串字段的值（keyPrefix 形如 "\"username\":\""）
+static BOOL replace_json_string_value(NSMutableData *d, const char *keyPrefix, const char *newValue) {
+    size_t kl = strlen(keyPrefix);
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    size_t len = d.length;
+    const unsigned char *p = (const unsigned char *)fb_memmem(b, len, keyPrefix, kl);
+    if (!p) return NO;
+    size_t vs = (size_t)(p - b) + kl;
+    size_t ve = vs;
+    while (ve < len && b[ve] != '"' && b[ve] != '\\') ve++;
+    if (ve >= len || b[ve] != '"') return NO;
+    [d replaceBytesInRange:NSMakeRange(vs, ve - vs) withBytes:newValue length:strlen(newValue)];
+    return YES;
+}
+
 // 对完整响应做「原样 JSON 字段替换」（保序、不重新转义），并同步 Content-Length
 static NSData *patch_response(NSData *raw) {
     const unsigned char *b = (const unsigned char *)raw.bytes;
@@ -484,11 +499,13 @@ static NSData *patch_response(NSData *raw) {
     if (fb_memmem(b, hdrEnd, "chunked", 7)) return nil;
 
     NSMutableData *nb = [NSMutableData dataWithBytes:(b + hdrEnd) length:(len - hdrEnd)];
-    BOOL changed = NO;
-    changed |= replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
-    changed |= replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
-    changed |= replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
-    if (!changed) return nil;
+    BOOL c1 = replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
+    BOOL c2 = replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
+    BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
+    BOOL c4 = replace_json_string_value(nb, "\"username\":\"", "TG@Curtinp118");
+    BOOL c5 = replace_json_string_value(nb, "\"avatar_url\":\"", "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
+    if (!(c1 || c2 || c3 || c4 || c5)) return nil;
+    DLog(@"[resp] 改 status=%d level=%d expire=%d user=%d avatar=%d", c1, c2, c3, c4, c5);
 
     NSString *hs = [[NSString alloc] initWithData:[NSData dataWithBytes:b length:hdrEnd] encoding:NSISOLatin1StringEncoding];
     if (!hs) return nil;
@@ -578,7 +595,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v18 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v19 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
