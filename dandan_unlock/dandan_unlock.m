@@ -472,7 +472,7 @@ static int patch_body_inplace(unsigned char *body, size_t bodyLen) {
     BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
     if (!(c1 || c2 || c3)) return 0;
     // 与脚本一致：同时替换 username / avatar_url（也正好腾出空间）
-    replace_json_string_value(nb, "\"username\":\"", "TG@Curtinp118");
+    replace_json_string_value(nb, "\"username\":\"", "小柳是个超霸");
     replace_json_string_value(nb, "\"avatar_url\":\"", "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
 
     NSInteger delta = (NSInteger)nb.length - (NSInteger)bodyLen;
@@ -559,7 +559,7 @@ static NSData *patch_response(NSData *raw) {
     BOOL c1 = replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
     BOOL c2 = replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
     BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
-    BOOL c4 = replace_json_string_value(nb, "\"username\":\"", "TG@Curtinp118");
+    BOOL c4 = replace_json_string_value(nb, "\"username\":\"", "小柳是个超霸");
     BOOL c5 = replace_json_string_value(nb, "\"avatar_url\":\"", "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
     if (!(c1 || c2 || c3 || c4 || c5)) return nil;
     DLog(@"[resp] 改 status=%d level=%d expire=%d user=%d avatar=%d", c1, c2, c3, c4, c5);
