@@ -293,7 +293,7 @@ static void loadIdentity(void) {
         CFArrayAppendValue(certs, leaf);
         CFRelease(leaf);
     }
-    CFArrayRef chain = CFArrayRef(CFDictionaryGetValue(item, kImportCertChain));
+    CFArrayRef chain = (CFArrayRef)CFDictionaryGetValue(item, kImportCertChain);
     if (chain) {
         for (CFIndex i = 0; i < CFArrayGetCount(chain); i++) {
             SecCertificateRef c = (SecCertificateRef)CFArrayGetValueAtIndex(chain, i);
@@ -444,6 +444,14 @@ static void installHooks(void) {
 }
 
 // ============================ HTTP 工具 ============================
+static const void *fb_memmem(const void *hay, size_t hl, const void *needle, size_t nl) {
+    if (!nl || hl < nl) return NULL;
+    const unsigned char *h = (const unsigned char *)hay;
+    for (size_t i = 0; i + nl <= hl; i++)
+        if (memcmp(h + i, needle, nl) == 0) return h + i;
+    return NULL;
+}
+
 static int tlsReadUntil(SSLContextRef ctx, NSMutableData *buf, const char *term, int termLen, size_t maxBytes) {
     char tmp[8192];
     for (;;) {
