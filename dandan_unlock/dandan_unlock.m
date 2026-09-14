@@ -453,6 +453,38 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
     return r;
 }
 
+// 严格等长改写：改 vip_status/vip_level/vip_expire_at，并用 website 腾出等量空间，总长度不变
+static int patch_body_inplace(unsigned char *body, size_t bodyLen) {
+    if (!body || bodyLen < 8) return 0;
+    NSMutableData *nb = [NSMutableData dataWithBytes:body length:bodyLen];
+    BOOL c1 = replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
+    BOOL c2 = replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
+    BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
+    if (!(c1 || c2 || c3)) return 0;
+    // 与脚本一致：同时替换 username / avatar_url（也正好腾出空间）
+    replace_json_string_value(nb, "\"username\":\"", "TG@Curtinp118");
+    replace_json_string_value(nb, "\"avatar_url\":\"", "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
+
+    NSInteger delta = (NSInteger)nb.length - (NSInteger)bodyLen;
+    if (delta > 0) {
+        // 变长了：把 website 的值清空来腾空间
+        replace_json_string_value(nb, "\"website\":\"", "");
+        delta = (NSInteger)nb.length - (NSInteger)bodyLen;
+    }
+    if (delta > 0) return 0;                 // 还是太长，放弃
+    if (delta < 0) {
+        // 变短了：在第一个字符后补空格（JSON 允许空白），凑齐长度
+        NSMutableData *pad = [NSMutableData data];
+        [pad appendData:[nb subdataWithRange:NSMakeRange(0, 1)]];
+        for (NSInteger i = 0; i < -delta; i++) [pad appendBytes:" " length:1];
+        [pad appendData:[nb subdataWithRange:NSMakeRange(1, nb.length - 1)]];
+        nb = pad;
+    }
+    if (nb.length != bodyLen) return 0;
+    memcpy(body, nb.bytes, bodyLen);
+    return 1;
+}
+
 // 就地等长改写：只改 vip_status/vip_level，字节数完全不变（缓冲区不够时用）
 static int patch_inplace(unsigned char *buf, size_t len) {
     int changed = 0;
@@ -574,20 +606,13 @@ static ssize_t my_read(int fd, void *buf, size_t count) {
 
     // 必须是完整响应才处理
     if (!response_complete((const unsigned char *)buf, (size_t)r)) { g_inside = 0; return r; }
-    NSData *raw = [NSData dataWithBytesNoCopy:buf length:(size_t)r freeWhenDone:NO];
-    NSData *out = patch_response(raw);
-    if (out && out.length <= count) {
-        memcpy(buf, out.bytes, out.length);
-        DLog(@"[socket] 响应改写(完整) fd=%d %ld -> %ld", fd, (long)r, (long)out.length);
-        g_inside = 0;
-        return (ssize_t)out.length;
-    }
-    // 缓冲区装不下改写后的长度：退化为就地等长改写（至少改 vip_status/vip_level）
-    if (out) {
-        int hit = patch_inplace((unsigned char *)buf, (size_t)r);
-        DLog(@"[socket] 响应改写(就地) fd=%d r=%ld count=%lu hit=%d", fd, (long)r, (unsigned long)count, hit);
-    } else {
-        DLog(@"[socket] 响应 fd=%d r=%ld count=%lu 未命中", fd, (long)r, (unsigned long)count);
+    const unsigned char *sep = (const unsigned char *)fb_memmem(buf, (size_t)r, "\r\n\r\n", 4);
+    if (sep) {
+        size_t hdrEnd = (size_t)(sep - (const unsigned char *)buf) + 4;
+        if (hdrEnd < (size_t)r && !fb_memmem(buf, hdrEnd, "chunked", 7)) {
+            int hit = patch_body_inplace((unsigned char *)buf + hdrEnd, (size_t)r - hdrEnd);
+            DLog(@"[socket] 响应等长改写 fd=%d r=%ld hit=%d", fd, (long)r, hit);
+        }
     }
     g_inside = 0;
     return r;
@@ -620,7 +645,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v20 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v21 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
