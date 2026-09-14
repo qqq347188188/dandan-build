@@ -1,4 +1,4 @@
-name: Build bodian_probe.dylib
+name: Build dandan_unlock.dylib
 
 on: [workflow_dispatch, push]
 
@@ -10,18 +10,19 @@ jobs:
 
       - name: Compile iOS arm64 dylib
         run: |
-          SRC=$(find . -name bodian_probe.m | head -n 1)
+          SRC=$(find . -name dandan_unlock.m | head -n 1)
           echo "Source file: $SRC"
           xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc \
+            -Wno-deprecated-declarations \
             -miphoneos-version-min=15.0 \
-            -framework Foundation -framework Security \
-            -o bodian_probe.dylib "$SRC"
+            -framework Foundation -framework WebKit \
+            -o dandan_unlock.dylib "$SRC"
 
       - name: Verify
-        run: file bodian_probe.dylib
+        run: file dandan_unlock.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bodian_probe.dylib
-          path: bodian_probe.dylib
+          name: dandan_unlock.dylib
+          path: dandan_unlock.dylib
