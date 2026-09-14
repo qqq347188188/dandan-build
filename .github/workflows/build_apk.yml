@@ -1,0 +1,66 @@
+name: Build danbo_unlock.apk
+
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download original APK (from Release tag "apk")
+        run: |
+          curl -fL -o danbo.apk \
+            "${{ github.server_url }}/${{ github.repository }}/releases/download/apk/danbo_android_08-20.apk"
+          ls -l danbo.apk
+
+      - name: Install tools (apktool + uber-apk-signer)
+        run: |
+          curl -fL -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          curl -fL -o uber-apk-signer.jar https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+      - name: Locate NDK
+        run: |
+          NDK=$(ls -d ${ANDROID_HOME}/ndk/* 2>/dev/null | sort -V | tail -n1)
+          [ -z "$NDK" ] && NDK=${ANDROID_HOME}/ndk-bundle
+          [ -d "$NDK" ] || { echo "!! runner 上没找到 NDK"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "using NDK: $NDK"
+
+      - name: Compile hook lib (3 ABIs)
+        run: |
+          TC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          mkdir -p out
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            case $abi in
+              arm64-v8a)   cc=$TC/aarch64-linux-android21-clang ;;
+              armeabi-v7a) cc=$TC/armv7a-linux-androideabi21-clang ;;
+              x86_64)      cc=$TC/x86_64-linux-android21-clang ;;
+            esac
+            mkdir -p out/$abi
+            $cc -shared -fPIC -O2 -o out/$abi/libdandanhook.so \
+              android_hook/dandan_hook.c -llog
+            ls -l out/$abi/libdandanhook.so
+          done
+
+      - name: Decode & patch APK
+        run: |
+          java -Xmx4g -jar apktool.jar d -f -o work danbo.apk
+          python3 android_hook/inject_smali.py work
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            mkdir -p work/lib/$abi
+            cp out/$abi/libdandanhook.so work/lib/$abi/
+          done
+
+      - name: Build & sign
+        run: |
+          java -Xmx4g -jar apktool.jar b -o danbo_unlock_unsigned.apk work
+          java -jar uber-apk-signer.jar -a danbo_unlock_unsigned.apk
+          ls -l *.apk
+          mv danbo_unlock_unsigned-aligned-debugSigned.apk danbo_unlock.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: danbo_unlock.apk
+          path: danbo_unlock.apk
