@@ -1,24 +1,29 @@
 //
-//  bodian_probe.m  (v2)
-//  波点音乐（Flutter 套壳）—— 拦截层探测 dylib
+//  bodian_probe.m  (v3 —— 进程内 MITM)
+//  波点音乐（Flutter 套壳）—— 把"圈X 的 MITM"搬进 App 进程内
 //
-//  只做诊断，不修改任何数据（SSL hook 只是"读一份"明文，不做改写），稳定性风险低。
+//  原理：
+//    Dart/NSURLSession 发起的 https 请求，在 connect() 时目标 IP:443 被重定向到
+//    本 dylib 在 127.0.0.1 起的本地 TLS 服务器；
+//    本地服务器用自签 CA 签发的证书（SAN 覆盖目标域名）完成 TLS 终止，
+//    拿到明文 HTTP 后原样转发到真实服务器，再把响应原样返回给 App。
 //
-//  v2 相对 v1 新增（关键）：
-//    1. fishhook 重绑系统 /usr/lib/libboringssl.dylib 的 SSL_read / SSL_write / *_ex；
-//       —— 如果 Dart 是「动态链接系统 BoringSSL」，这里就能直接抓到 bd-api.kuwo.cn 的明文
-//       —— 如果抓不到，说明 Flutter 自带静态 BoringSSL（符号已 strip），dylib 方案基本无解
-//    2. 记录 fishhook 到底把哪个镜像的 SSL_read 槽位改掉了（判断谁在动态链接它）
-//    3. 新增 socket() hook，判断是不是 QUIC(UDP/443)，排除 HTTP/3 干扰
-//    4. 对命中的 TLS 连接，把完整响应体攒齐后 dump（后续对齐字段要用）
+//  v3 目标（第一步）：验证握手 + 透明转发 + 抓明文。
+//    改写（bdyy.js 逻辑）留到 STAGE 2，在 forwardRequest() 里接 JSC 即可。
 //
 //  日志：
-//    Documents/bodian_probe.log —— 诊断结论
-//    Documents/bodian_resp.log  —— 抓到的目标响应原文（NSURLSession 与 SSL 明文）
+//    Documents/bodian_mitm.log  —— 运行/诊断
+//    Documents/bodian_resp.log  —— 拦截到的响应原文（截断 64KB）
+//
+//  开关（ Documents/ 下）：
+//    bodian_mitm_off        存在 => 完全跳过 MITM（App 行为不变）
+//    bodian_mitm_hosts.txt  每行一条规则（# 注释）：以点开头=后缀匹配，否则精确/后缀匹配
 //
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <Security/Security.h>
+#import <Security/SecureTransport.h>
 
 #include <stdarg.h>
 #include <dlfcn.h>
@@ -37,8 +42,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 
-static void DLog(NSString *fmt, ...);
-static void Dump(NSString *name, NSData *data);
+#import "bodian_cert.h"
 
 // ============================ fishhook ============================
 #ifdef __LP64__
@@ -172,7 +176,7 @@ static NSString *SandboxPath(NSString *name) {
     NSString *d = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     return [d stringByAppendingPathComponent:name];
 }
-static NSString *ProbeLogPath(void) { return SandboxPath(@"bodian_probe.log"); }
+static NSString *ProbeLogPath(void) { return SandboxPath(@"bodian_mitm.log"); }
 static NSString *RespLogPath(void)  { return SandboxPath(@"bodian_resp.log"); }
 
 static void appendFile(NSString *path, NSString *text) {
@@ -188,508 +192,497 @@ static void DLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[bodian_probe] %@", m);
+    NSLog(@"[bodian_mitm] %@", m);
     appendFile(ProbeLogPath(), [NSString stringWithFormat:@"%@  %@\n", [NSDate date], m]);
 }
 
 static void Dump(NSString *name, NSData *data) {
     if (!data.length) return;
-    NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!t) t = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+    NSData *d = data;
+    if (d.length > 65536) d = [d subdataWithRange:NSMakeRange(0, 65536)];
+    NSString *t = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (!t) t = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
     if (!t) return;
     appendFile(RespLogPath(), [NSString stringWithFormat:
-        @"\n===== %@  (%lu bytes) =====\n%@\n", name, (unsigned long)data.length, t]);
+        @"\n===== %@  (%lu bytes) =====\n%@\n", name, (unsigned long)d.length, t]);
 }
 
-// ============================ 小工具 ============================
-static const void *fb_memmem(const void *hay, size_t hl, const void *needle, size_t nl) {
-    if (!nl || hl < nl) return NULL;
-    const unsigned char *h = (const unsigned char *)hay;
-    for (size_t i = 0; i + nl <= hl; i++)
-        if (memcmp(h + i, needle, nl) == 0) return h + i;
-    return NULL;
-}
+// ============================ 目标 host / IP 集合 ============================
+static NSMutableSet *g_targetHosts;
+static NSMutableSet *g_targetIPs;
+static NSMutableSet *g_targetIP6;
+static pthread_mutex_t g_ipLock = PTHREAD_MUTEX_INITIALIZER;
 
-static long parse_content_length(const unsigned char *b, size_t hdrEnd) {
-    static const char *key = "content-length:";
-    const size_t keyLen = 15;
-    size_t i = 0;
-    while (i < hdrEnd) {
-        size_t j = i;
-        while (j + 1 < hdrEnd && !(b[j] == '\r' && b[j + 1] == '\n')) j++;
-        size_t lineLen = (j < hdrEnd) ? (j - i) : (hdrEnd - i);
-        if (lineLen > keyLen) {
-            int ok = 1;
-            for (size_t k = 0; k < keyLen; k++) {
-                unsigned char c = b[i + k];
-                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
-                if (c != (unsigned char)key[k]) { ok = 0; break; }
-            }
-            if (ok) {
-                long v = 0; int seen = 0;
-                for (size_t k = keyLen; k < lineLen; k++) {
-                    unsigned char c = b[i + k];
-                    if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); seen = 1; }
-                    else if (seen) break;
-                }
-                return seen ? v : 0;
-            }
-        }
-        if (j >= hdrEnd) break;
-        i = j + 2;
-    }
-    return -1;
-}
-
-// ============================ 目标域名判定 ============================
-static const char *kHostKeys[] = {
-    "kuwo.cn", "kuwo.com", "bodian", "l.qq.com", "gdt.qq.com", "tencentmusic.com"
-};
-static BOOL hostMatched(NSString *host) {
+static BOOL isTargetHost(NSString *host) {
     if (!host.length) return NO;
     NSString *h = host.lowercaseString;
-    for (size_t i = 0; i < sizeof(kHostKeys) / sizeof(kHostKeys[0]); i++) {
-        NSString *k = [NSString stringWithUTF8String:kHostKeys[i]];
-        if ([h containsString:k]) return YES;
-    }
-    return NO;
-}
-static BOOL cstrMatched(const char *s) {
-    if (!s) return NO;
-    for (size_t i = 0; i < sizeof(kHostKeys) / sizeof(kHostKeys[0]); i++)
-        if (strstr(s, kHostKeys[i])) return YES;
-    return NO;
-}
-static BOOL bytesMatched(const unsigned char *b, size_t len) {
-    if (!b || len < 5) return NO;
-    static const char *keys[] = { "kuwo", "bd-api", "gdt.qq", "l.qq.com", "tencentmusic", "bodian" };
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        size_t kl = strlen(keys[i]);
-        if (fb_memmem(b, len, keys[i], kl)) return YES;
-    }
-    return NO;
-}
-
-// ============================ 符号探测 ============================
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static NSMutableString *g_symReport;
-
-static BOOL nameIsSSL(const char *n) {
-    return strcmp(n, "SSL_read") == 0 || strcmp(n, "SSL_write") == 0 ||
-           strcmp(n, "SSL_read_ex") == 0 || strcmp(n, "SSL_write_ex") == 0 ||
-           strcmp(n, "SSL_CTX_new") == 0 || strcmp(n, "SSL_new") == 0;
-}
-
-static BOOL pathIsInteresting(const char *p, int idx) {
-    if (idx == 0) return YES;
-    if (!p) return NO;
-    NSString *s = [[NSString stringWithUTF8String:p] lowercaseString];
-    return [s containsString:@"flutter"] || [s containsString:@"app.framework"] ||
-           [s containsString:@"boringssl"];
-}
-
-static void scan_image_for_ssl(const struct mach_header *h, intptr_t slide, int idx) {
-    Dl_info info; if (dladdr(h, &info) == 0) return;
-    const char *img = info.dli_fname ? info.dli_fname : "?";
-    BOOL interesting = pathIsInteresting(img, idx);
-
-    fbt_segment_command *cur = NULL, *linkedit = NULL;
-    struct symtab_command *symcmd = NULL;
-    uintptr_t p = (uintptr_t)h + sizeof(fbt_mach_header);
-    for (uint32_t i = 0; i < h->ncmds; i++, p += cur->cmdsize) {
-        cur = (fbt_segment_command *)p;
-        if (cur->cmd == FBT_LC_SEG) { if (strcmp(cur->segname, SEG_LINKEDIT) == 0) linkedit = cur; }
-        else if (cur->cmd == LC_SYMTAB) symcmd = (struct symtab_command *)cur;
-    }
-    if (!symcmd || !linkedit) return;
-
-    uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
-    fbt_nlist *symtab = (fbt_nlist *)(base + symcmd->symoff);
-    char *strtab = (char *)(base + symcmd->stroff);
-
-    int found = 0;
-    for (uint32_t i = 0; i < symcmd->nsyms; i++) {
-        uint32_t off = symtab[i].n_un.n_strx;
-        if (!off) continue;
-        const char *name = strtab + off;
-        const char *n = (name[0] == '_') ? name + 1 : name;
-        if (nameIsSSL(n)) {
-            uintptr_t addr = (uintptr_t)slide + (uintptr_t)symtab[i].n_value;
-            if (g_symReport) [g_symReport appendFormat:@"    %s  @ 0x%lx  (%s)\n", n, (unsigned long)addr, img];
-            found++;
+    @synchronized (g_targetHosts) {
+        for (NSString *rule in g_targetHosts) {
+            NSString *search = [rule hasPrefix:@"."] ? rule : [@"." stringByAppendingString:rule];
+            if ([h isEqualToString:rule] || [h hasSuffix:search]) return YES;
         }
     }
-    if (found) DLog(@"[sym] %s : nsyms=%u SSL命中=%d", img, symcmd->nsyms, found);
-    else if (interesting) DLog(@"[sym] %s : nsyms=%u SSL命中=0", img, symcmd->nsyms);
+    return NO;
 }
-
-static void scan_all_images(void) {
-    if (!g_symReport) g_symReport = [NSMutableString string];
-    uint32_t n = _dyld_image_count();
-    DLog(@"[sym] 共 %u 个已加载镜像，扫描符号表…", n);
-    for (uint32_t i = 0; i < n; i++)
-        scan_image_for_ssl(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), (int)i);
-    DLog(@"[sym] ==== SSL 符号扫描结果 ====\n%@    (空 = 符号被 strip)",
-         g_symReport.length ? g_symReport : @"");
-}
-
-static void check_dlsym(void) {
-    const char *names[] = { "SSL_read", "SSL_write", "SSL_read_ex", "SSL_write_ex", "SSL_CTX_new" };
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        void *p = dlsym(RTLD_DEFAULT, names[i]);
-        if (p) {
-            Dl_info di;
-            const char *img = (dladdr(p, &di) != 0 && di.dli_fname) ? di.dli_fname : "?";
-            DLog(@"[dlsym] %s 已导出 -> %p  (%s)", names[i], p, img);
-        } else {
-            DLog(@"[dlsym] %s 未导出", names[i]);
-        }
-    }
-}
-
-// ============================ getaddrinfo / socket / connect ============================
-#define MAX_IPS 128
-static char g_ips[MAX_IPS][46];
-static int  g_ipCount = 0;
-
-static int  (*o_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
-static int  (*o_connect)(int, const struct sockaddr *, socklen_t);
-static int  (*o_socket)(int, int, int);
-static unsigned char g_sockType[4096];
-static int g_sockLog = 0;
-
-static BOOL knownIP(const char *ip) {
-    if (!ip) return NO;
-    pthread_mutex_lock(&g_lock);
-    BOOL hit = NO;
-    for (int i = 0; i < g_ipCount; i++) if (strcmp(g_ips[i], ip) == 0) { hit = YES; break; }
-    pthread_mutex_unlock(&g_lock);
-    return hit;
-}
-static void rememberIP(const char *ip) {
+static void addTargetIP(NSString *ip) {
     if (!ip) return;
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_ipCount; i++) if (strcmp(g_ips[i], ip) == 0) { pthread_mutex_unlock(&g_lock); return; }
-    if (g_ipCount < MAX_IPS) { snprintf(g_ips[g_ipCount], sizeof(g_ips[0]), "%s", ip); g_ipCount++; }
-    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&g_ipLock); [g_targetIPs addObject:ip]; pthread_mutex_unlock(&g_ipLock);
 }
+static void addTargetIP6(NSString *ip) {
+    if (!ip) return;
+    pthread_mutex_lock(&g_ipLock); [g_targetIP6 addObject:ip]; pthread_mutex_unlock(&g_ipLock);
+}
+static BOOL isTargetIP(struct in_addr a) {
+    char ip[64]; inet_ntop(AF_INET, &a, ip, sizeof ip);
+    pthread_mutex_lock(&g_ipLock); BOOL r = [g_targetIPs containsObject:@(ip)]; pthread_mutex_unlock(&g_ipLock); return r;
+}
+static BOOL isTargetIP6(struct in6_addr a) {
+    char ip[64]; inet_ntop(AF_INET6, &a, ip, sizeof ip);
+    pthread_mutex_lock(&g_ipLock); BOOL r = [g_targetIP6 containsObject:@(ip)]; pthread_mutex_unlock(&g_ipLock); return r;
+}
+
+static void initTargetHosts(void) {
+    g_targetHosts = [NSMutableSet set];
+    g_targetIPs   = [NSMutableSet set];
+    g_targetIP6   = [NSMutableSet set];
+    NSArray *builtin = @[ @".kuwo.cn", @".kuwo.com", @".l.qq.com", @".tencentmusic.com",
+                          @"xs.gdt.qq.com", @"tmeadcomm.y.qq.com" ];
+    for (NSString *r in builtin) [g_targetHosts addObject:r];
+    NSString *path = SandboxPath(@"bodian_mitm_hosts.txt");
+    NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+    if (content.length) {
+        for (NSString *line in [content componentsSeparatedByString:@"\n"]) {
+            NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length && ![t hasPrefix:@"#"]) [g_targetHosts addObject:t];
+        }
+        DLog(@"[mitm] 已加载自定义 hosts 规则，共 %lu 条", (unsigned long)g_targetHosts.count);
+    }
+}
+
+// ============================ 证书（自签 CA 签发的服务器身份） ============================
+// kSecImportExportPassphrase / kSecImportItemIdentity / kSecImportItemCertChain
+// 未在公共头声明，但运行期字符串值即下列三个，直接用 CFSTR 等价物。
+#define kImportPassphrase CFSTR("passphrase")
+#define kImportIdentity  CFSTR("identity")
+#define kImportCertChain CFSTR("certChain")
+extern OSStatus SecPKCS12Import(CFDataRef inPKCS12Data, CFDictionaryRef options, CFArrayRef *items);
+
+static CFArrayRef g_serverCerts = NULL;
+
+static void loadIdentity(void) {
+    NSString *b64 = [NSString stringWithUTF8String:kBodianP12B64];
+    NSData *p12 = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    if (!p12.length) { DLog(@"[cert] P12 内嵌数据为空"); return; }
+    CFMutableDictionaryRef opts = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionaryAddValue(opts, kImportPassphrase, CFSTR("bodian"));
+    CFArrayRef items = NULL;
+    OSStatus st = SecPKCS12Import((__bridge CFDataRef)p12, opts, &items);
+    CFRelease(opts);
+    if (st != noErr || !items || CFArrayGetCount(items) == 0) {
+        DLog(@"[cert] SecPKCS12Import 失败 st=%d", (int)st);
+        if (items) CFRelease(items);
+        return;
+    }
+    CFDictionaryRef item = CFArrayGetValueAtIndex(items, 0);
+    SecIdentityRef ident = (SecIdentityRef)CFDictionaryGetValue(item, kImportIdentity);
+    if (!ident) { DLog(@"[cert] 导入项中没有 identity"); CFRelease(items); return; }
+    CFMutableArrayRef certs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    SecCertificateRef leaf = NULL;
+    if (SecIdentityCopyCertificate(ident, &leaf) == noErr && leaf) {
+        CFArrayAppendValue(certs, leaf);
+        CFRelease(leaf);
+    }
+    CFArrayRef chain = CFArrayRef(CFDictionaryGetValue(item, kImportCertChain));
+    if (chain) {
+        for (CFIndex i = 0; i < CFArrayGetCount(chain); i++) {
+            SecCertificateRef c = (SecCertificateRef)CFArrayGetValueAtIndex(chain, i);
+            if (c && !CFArrayContainsValue(certs, CFRangeMake(0, CFArrayGetCount(certs)), c))
+                CFArrayAppendValue(certs, c);
+        }
+    }
+    g_serverCerts = certs;
+    CFRelease(items);
+    DLog(@"[cert] 身份加载成功，证书链 %ld 张", (long)CFArrayGetCount(certs));
+}
+
+// ============================ SecureTransport IO ============================
+// 对所有 SSLContext（本地服务端 / 上游客户端）通用：fd 由 SSLConnectionRef 传入
+static OSStatus mitmRead(SSLConnectionRef conn, void *data, size_t *len) {
+    int fd = (int)(intptr_t)conn;
+    size_t want = *len, got = 0;
+    *len = 0;
+    while (got < want) {
+        ssize_t r = read(fd, (char *)data + got, want - got);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r == 0) { *len = got; return errSSLClosedGraceful; }
+        if (errno == EINTR) continue;
+        *len = got;
+        return errSSLClosedAbort;
+    }
+    *len = got;
+    return noErr;
+}
+
+static OSStatus mitmWrite(SSLConnectionRef conn, const void *data, size_t *len) {
+    int fd = (int)(intptr_t)conn;
+    size_t want = *len, sent = 0;
+    *len = 0;
+    while (sent < want) {
+        ssize_t r = write(fd, (const char *)data + sent, want - sent);
+        if (r > 0) { sent += (size_t)r; continue; }
+        if (r == 0) break;
+        if (errno == EINTR) continue;
+        *len = sent;
+        return errSSLClosedAbort;
+    }
+    *len = sent;
+    return noErr;
+}
+
+static SSLContextRef makeServerCtx(int fd) {
+    SSLContextRef ctx = SSLCreateContext(kCFAllocatorDefault, kSSLServerSide, kSSLStreamType);
+    if (!ctx) return NULL;
+    SSLSetIOFuncs(ctx, mitmRead, mitmWrite);
+    SSLSetConnection(ctx, (SSLConnectionRef)(intptr_t)fd);
+    SSLSetCertificate(ctx, g_serverCerts);
+    return ctx;
+}
+
+static SSLContextRef makeClientCtx(int fd, NSString *host) {
+    SSLContextRef ctx = SSLCreateContext(kCFAllocatorDefault, kSSLClientSide, kSSLStreamType);
+    if (!ctx) return NULL;
+    SSLSetIOFuncs(ctx, mitmRead, mitmWrite);
+    SSLSetConnection(ctx, (SSLConnectionRef)(intptr_t)fd);
+    SSLSetPeerDomainName(ctx, host.UTF8String, strlen(host.UTF8String ?: ""));
+    return ctx;
+}
+
+static void setSockTimeout(int fd, int sec) {
+    struct timeval tv; tv.tv_sec = sec; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+// ============================ connect / getaddrinfo hook ============================
+static int (*o_getaddrinfo)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+static int (*o_connect)(int, const struct sockaddr *, socklen_t);
+static int (*o_socket)(int, int, int);
+
+static int g_localPort = 0;
+static int g_ipv6Up = 0;
+static volatile int g_mitmEnabled = 0;
 
 static int my_getaddrinfo(const char *node, const char *service,
                           const struct addrinfo *hints, struct addrinfo **res) {
     int r = o_getaddrinfo(node, service, hints, res);
-    if (r == 0 && res && *res && cstrMatched(node)) {
-        NSMutableString *sb = [NSMutableString string];
-        for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
-            if (ai->ai_family == AF_INET) {
-                char ip[INET_ADDRSTRLEN] = {0};
-                inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ip, sizeof(ip));
-                rememberIP(ip);
-                [sb appendFormat:@"%@ ", [NSString stringWithUTF8String:ip]];
+    if (r == 0 && node && res && *res) {
+        NSString *host = [NSString stringWithUTF8String:node];
+        if (isTargetHost(host)) {
+            int n4 = 0, n6 = 0;
+            for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
+                char ip[64] = {0};
+                if (ai->ai_family == AF_INET && ai->ai_addr) {
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ip, sizeof ip);
+                    addTargetIP(@(ip)); n4++;
+                } else if (ai->ai_family == AF_INET6 && ai->ai_addr) {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, ip, sizeof ip);
+                    addTargetIP6(@(ip)); n6++;
+                }
             }
+            DLog(@"[dns] 目标域名 %s -> IPv4x%d IPv6x%d（已登记，connect 时重定向）", node, n4, n6);
         }
-        DLog(@"[dns] ★ 解析目标域名 %s -> %@", node ? node : "?", sb);
     }
     return r;
-}
-
-static int my_socket(int domain, int type, int proto) {
-    int fd = o_socket(domain, type, proto);
-    if (fd >= 0 && fd < 4096) g_sockType[fd] = (unsigned char)(type & 0x0f);
-    return fd;
 }
 
 static int my_connect(int fd, const struct sockaddr *addr, socklen_t al) {
-    int r = o_connect(fd, addr, al);
-    if (addr && addr->sa_family == AF_INET) {
-        const struct sockaddr_in *s = (const struct sockaddr_in *)addr;
-        int port = ntohs(s->sin_port);
-        char ip[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
-        const char *kind = "?";
-        if (fd >= 0 && fd < 4096) {
-            int t = g_sockType[fd] & 0x0f;
-            if (t == SOCK_STREAM) kind = "TCP";
-            else if (t == SOCK_DGRAM) kind = "UDP";
-        }
-        if (knownIP(ip)) {
-            DLog(@"[socket] ★ 直连目标 IP fd=%d %s %s:%d (ret=%d)", fd, kind, ip, port, r);
-        } else if (port == 443 && ++g_sockLog <= 20) {
-            DLog(@"[socket] connect(样本) %s %s:443", kind, ip);
-        }
-    }
-    return r;
-}
-
-// ============================ NSURLSession 探测 ============================
-static int g_urlCount = 0;
-
-static void noteURL(NSURL *u, const char *via) {
-    if (!u) return;
-    BOOL hit = hostMatched(u.host);
-    pthread_mutex_lock(&g_lock);
-    int n = ++g_urlCount;
-    pthread_mutex_unlock(&g_lock);
-    if (hit) DLog(@"[NSURLSession/%s] ★ 命中 %@", via, u.absoluteString);
-    else if (n <= 30) DLog(@"[NSURLSession/%s] %@", via, u.absoluteString);
-}
-
-static id (*o_dt_req)(id, SEL, NSURLRequest *);
-static id my_dt_req(id self, SEL _cmd, NSURLRequest *req) {
-    noteURL(req.URL, "task");
-    return o_dt_req(self, _cmd, req);
-}
-
-typedef void (^ProbeCompletion)(NSData *, NSURLResponse *, NSError *);
-static id (*o_dt_req_c)(id, SEL, NSURLRequest *, ProbeCompletion);
-static id my_dt_req_c(id self, SEL _cmd, NSURLRequest *req, ProbeCompletion completion) {
-    NSURL *u = req.URL;
-    noteURL(u, "completion");
-    if (!completion || !hostMatched(u.host)) return o_dt_req_c(self, _cmd, req, completion);
-    return o_dt_req_c(self, _cmd, req, ^(NSData *d, NSURLResponse *resp, NSError *err) {
-        DLog(@"[NSURLSession/completion] ★ 响应 %@ status=%ld len=%lu",
-             u.absoluteString, (long)((NSHTTPURLResponse *)resp).statusCode, (unsigned long)d.length);
-        Dump([NSString stringWithFormat:@"NSURLSession %@", u.absoluteString], d);
-        completion(d, resp, err);
-    });
-}
-
-static id (*o_dt_url_c)(id, SEL, NSURL *, ProbeCompletion);
-static id my_dt_url_c(id self, SEL _cmd, NSURL *u, ProbeCompletion completion) {
-    noteURL(u, "completion");
-    if (!completion || !hostMatched(u.host)) return o_dt_url_c(self, _cmd, u, completion);
-    return o_dt_url_c(self, _cmd, u, ^(NSData *d, NSURLResponse *resp, NSError *err) {
-        Dump([NSString stringWithFormat:@"NSURLSession %@", u.absoluteString], d);
-        completion(d, resp, err);
-    });
-}
-
-static id (*o_session)(id, SEL, id, id, id);
-static id my_session(id self, SEL _cmd, id config, id delegate, id queue) {
-    const char *dn = delegate ? object_getClassName(delegate) : "(nil)";
-    DLog(@"[NSURLSession] sessionWithConfiguration: delegate=%s", dn);
-    return o_session(self, _cmd, config, delegate, queue);
-}
-
-// ============================ SSL 明文探测（v2 核心） ============================
-// 关注的 TLS 连接：只存指针，判断"这个 SSL 上出现过目标域名"
-#define TLS_MAX 256
-static const void *g_tlsSsl[TLS_MAX];
-static volatile int g_tlsHot[TLS_MAX];
-
-static int tlsSlot(const void *ssl) {
-    uintptr_t v = (uintptr_t)ssl >> 4;
-    return (int)((v ^ (v >> 9) ^ (v >> 17)) & (TLS_MAX - 1));
-}
-static void tlsMark(const void *ssl) {
-    int i = tlsSlot(ssl);
-    g_tlsSsl[i] = ssl;
-    g_tlsHot[i] = 1;
-}
-static BOOL tlsIsHot(const void *ssl) {
-    int i = tlsSlot(ssl);
-    return (g_tlsSsl[i] == ssl) && g_tlsHot[i];
-}
-
-// 每连接的响应攒包（用于输出完整响应体）
-#define TLS_ACC 24
-typedef struct { const void *ssl; NSMutableData *acc; } TlsAcc;
-static TlsAcc g_acc[TLS_ACC];
-static pthread_mutex_t g_tlsLock = PTHREAD_MUTEX_INITIALIZER;
-static size_t g_dumpTotal = 0;
-#define DUMP_LIMIT (3u * 1024u * 1024u)
-
-static int g_sslWriteCalls = 0, g_sslReadCalls = 0, g_sslHotHits = 0;
-
-static BOOL looksLikeHTTPReq(const unsigned char *b, size_t len) {
-    static const char *ms[] = { "GET ", "POST", "PUT ", "HEAD", "DELE", "OPTI", "PATC" };
-    if (len < 5) return NO;
-    for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]); i++)
-        if (memcmp(b, ms[i], 4) == 0) return YES;
-    return NO;
-}
-
-// 解析 "\r\nHost: xxx\r\n"
-static NSString *extractHost(const unsigned char *b, size_t len) {
-    const unsigned char *h = (const unsigned char *)fb_memmem(b, len, "\r\nHost: ", 8);
-    size_t hs = 0;
-    if (h) hs = (size_t)(h - b) + 8;
-    else {
-        h = (const unsigned char *)fb_memmem(b, len, "\r\nhost: ", 8);
-        if (!h) return nil;
-        hs = (size_t)(h - b) + 8;
-    }
-    size_t he = hs;
-    while (he < len && b[he] != '\r' && b[he] != '\n') he++;
-    if (he <= hs) return nil;
-    return [[NSString alloc] initWithBytes:(b + hs) length:(he - hs) encoding:NSUTF8StringEncoding];
-}
-
-static void tlsAccum(const void *ssl, const void *buf, size_t len) {
-    if (g_dumpTotal > DUMP_LIMIT) return;
-    pthread_mutex_lock(&g_tlsLock);
-    TlsAcc *e = NULL;
-    for (int i = 0; i < TLS_ACC; i++) if (g_acc[i].ssl == ssl) { e = &g_acc[i]; break; }
-    if (!e) {
-        for (int i = 0; i < TLS_ACC; i++) if (!g_acc[i].ssl) {
-            g_acc[i].ssl = ssl;
-            g_acc[i].acc = [NSMutableData data];
-            e = &g_acc[i];
-            break;
-        }
-    }
-    if (!e) { pthread_mutex_unlock(&g_tlsLock); return; }
-
-    [e->acc appendBytes:buf length:len];
-    if (e->acc.length > 512 * 1024) [e->acc setLength:0];   // 异常大的包，丢弃重来
-
-    const unsigned char *b = (const unsigned char *)e->acc.bytes;
-    size_t n = e->acc.length;
-    const unsigned char *sep = (const unsigned char *)fb_memmem(b, n, "\r\n\r\n", 4);
-    if (!sep) { pthread_mutex_unlock(&g_tlsLock); return; }
-    size_t hdrEnd = (size_t)(sep - b) + 4;
-    long cl = parse_content_length(b, hdrEnd);
-    if (cl < 0) {
-        // chunked / 无 Content-Length：攒到一定量就原样输出（尽力而为）
-        if (n < 65536) { pthread_mutex_unlock(&g_tlsLock); return; }
-        cl = (long)(n - hdrEnd);
-    }
-    if (n < hdrEnd + (size_t)cl) { pthread_mutex_unlock(&g_tlsLock); return; }
-
-    NSData *whole = [NSData dataWithBytes:b length:hdrEnd + (size_t)cl];
-    [e->acc setLength:0];
-    g_dumpTotal += whole.length;
-    pthread_mutex_unlock(&g_tlsLock);
-
-    Dump([NSString stringWithFormat:@"SSL 响应 (SSL=%p)", ssl], whole);
-}
-
-// ---------------- hook: SSL_write（明文请求） ----------------
-static int (*o_SSL_write)(void *, const void *, int);
-static int my_SSL_write(void *ssl, const void *buf, int num) {
-    int r = o_SSL_write(ssl, buf, num);
-    if (r <= 0) return r;
-    if (g_sslWriteCalls++ == 0)
-        DLog(@"[ssl] ★★ my_SSL_write 首次被调用（说明有代码动态链接系统 BoringSSL）");
-
-    size_t len = (size_t)r;
-    if (len < 16 || len > 256 * 1024) return r;
-    const unsigned char *b = (const unsigned char *)buf;
-
-    if (looksLikeHTTPReq(b, len)) {
-        NSString *host = extractHost(b, len);
-        size_t pe = 0;
-        while (pe < len && b[pe] != ' ' && b[pe] != '\r') pe++;
-        NSString *line = [[NSString alloc] initWithBytes:b length:(pe < 160 ? pe : 160)
-                                                encoding:NSUTF8StringEncoding];
-        DLog(@"[ssl] HTTP请求 host=%@ | %@", host ?: @"(?)", line ?: @"?");
-        if (hostMatched(host)) {
-            tlsMark(ssl);
-            g_sslHotHits++;
-            DLog(@"[ssl] ★★★ 命中目标 Host=%@（SSL=%p），后续响应会被记录", host, ssl);
-            size_t dl = len < 2048 ? len : 2048;
-            Dump([NSString stringWithFormat:@"SSL 请求 host=%@", host],
-                 [NSData dataWithBytes:b length:dl]);
-        }
-    } else if (bytesMatched(b, len)) {
-        // HTTP/2(HPACK) 或二进制帧里直接出现了目标域名字符串
-        tlsMark(ssl);
-        DLog(@"[ssl] ★★ 二进制帧里出现目标域名（SSL=%p），标记为关注", ssl);
-    }
-    return r;
-}
-
-// ---------------- hook: SSL_read（明文响应） ----------------
-static int (*o_SSL_read)(void *, void *, int);
-static int my_SSL_read(void *ssl, void *buf, int num) {
-    int r = o_SSL_read(ssl, buf, num);
-    if (r <= 0) return r;
-    if (g_sslReadCalls++ == 0)
-        DLog(@"[ssl] ★★ my_SSL_read 首次被调用");
-    if (tlsIsHot(ssl)) tlsAccum(ssl, buf, (size_t)r);
-    return r;
-}
-
-// ---------------- hook: *_ex 变体（有的库用新 API） ----------------
-static int (*o_SSL_write_ex)(void *, const void *, size_t, size_t *);
-static int my_SSL_write_ex(void *ssl, const void *buf, size_t num, size_t *written) {
-    int r = o_SSL_write_ex(ssl, buf, num, written);
-    if (r == 1 && written && *written > 0 && *written <= 256 * 1024) {
-        size_t len = *written;
-        const unsigned char *b = (const unsigned char *)buf;
-        if (g_sslWriteCalls++ == 0)
-            DLog(@"[ssl] ★★ my_SSL_write_ex 首次被调用");
-        if (looksLikeHTTPReq(b, len)) {
-            NSString *host = extractHost(b, len);
-            if (hostMatched(host)) {
-                tlsMark(ssl);
-                DLog(@"[ssl] ★★★ 命中目标 Host=%@（SSL=%p）", host, ssl);
+    if (g_mitmEnabled && g_localPort && addr && al >= sizeof(struct sockaddr_in)) {
+        if (addr->sa_family == AF_INET) {
+            const struct sockaddr_in *s = (const struct sockaddr_in *)addr;
+            int port = ntohs(s->sin_port);
+            if (port == 443 && isTargetIP(s->sin_addr)) {
+                struct sockaddr_in lo;
+                memcpy(&lo, s, sizeof lo);
+                lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                lo.sin_port = htons((uint16_t)g_localPort);
+                int r = o_connect(fd, (const struct sockaddr *)&lo, sizeof lo);
+                char ip[64] = {0};
+                inet_ntop(AF_INET, &s->sin_addr, ip, sizeof ip);
+                DLog(@"[mitm] 重定向 %s:443 -> 127.0.0.1:%d (fd=%d ret=%d)", ip, g_localPort, fd, r);
+                return r;
+            }
+        } else if (addr->sa_family == AF_INET6 && g_ipv6Up &&
+                   al >= sizeof(struct sockaddr_in6)) {
+            const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)addr;
+            int port = ntohs(s6->sin6_port);
+            if (port == 443 && isTargetIP6(s6->sin6_addr)) {
+                struct sockaddr_in6 lo;
+                memcpy(&lo, s6, sizeof lo);
+                lo.sin6_addr = in6addr_loopback;
+                lo.sin6_port = htons((uint16_t)g_localPort);
+                int r = o_connect(fd, (const struct sockaddr *)&lo, sizeof lo);
+                DLog(@"[mitm] 重定向 [IPv6]:443 -> ::1:%d (fd=%d ret=%d)", g_localPort, fd, r);
+                return r;
             }
         }
     }
-    return r;
+    return o_connect(fd, addr, al);
 }
 
-static int (*o_SSL_read_ex)(void *, void *, size_t, size_t *);
-static int my_SSL_read_ex(void *ssl, void *buf, size_t num, size_t *readbytes) {
-    int r = o_SSL_read_ex(ssl, buf, num, readbytes);
-    if (r == 1 && readbytes && *readbytes > 0) {
-        if (g_sslReadCalls++ == 0)
-            DLog(@"[ssl] ★★ my_SSL_read_ex 首次被调用");
-        if (tlsIsHot(ssl)) tlsAccum(ssl, buf, *readbytes);
+static void installHooks(void) {
+    o_getaddrinfo = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))
+                    dlsym(RTLD_DEFAULT, "getaddrinfo");
+    o_connect = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_DEFAULT, "connect");
+    o_socket  = (int (*)(int, int, int))dlsym(RTLD_DEFAULT, "socket");
+    struct fbt_rebinding rb[4];
+    size_t n = 0;
+    if (o_getaddrinfo) { rb[n].name = "getaddrinfo"; rb[n].replacement = (void *)my_getaddrinfo; rb[n].replaced = (void **)&o_getaddrinfo; n++; }
+    if (o_connect)     { rb[n].name = "connect";     rb[n].replacement = (void *)my_connect;     rb[n].replaced = (void **)&o_connect;     n++; }
+    int ret = n ? fbt_rebind(rb, n) : -2;
+    DLog(@"[rebind] fishhook ret=%d\n%s", ret, g_rb_log[0] ? g_rb_log : "");
+}
+
+// ============================ HTTP 工具 ============================
+static int tlsReadUntil(SSLContextRef ctx, NSMutableData *buf, const char *term, int termLen, size_t maxBytes) {
+    char tmp[8192];
+    for (;;) {
+        size_t got = 0;
+        OSStatus s = SSLRead(ctx, tmp, sizeof tmp, &got);
+        if (s == noErr && got > 0) {
+            [buf appendBytes:tmp length:got];
+            if (buf.length >= (size_t)termLen &&
+                fb_memmem(buf.bytes, buf.length, term, (size_t)termLen)) return 0;
+            if (buf.length > maxBytes) return -1;
+            continue;
+        }
+        return -1;   // 关闭 / 错误 / 0 字节
     }
-    return r;
+}
+
+static int tlsReadBytes(SSLContextRef ctx, NSMutableData *buf, size_t n) {
+    char tmp[8192];
+    size_t remaining = n;
+    while (remaining > 0) {
+        size_t got = 0;
+        OSStatus s = SSLRead(ctx, tmp, remaining > sizeof tmp ? sizeof tmp : remaining, &got);
+        if (s != noErr || got == 0) return -1;
+        [buf appendBytes:tmp length:got];
+        remaining -= got;
+    }
+    return 0;
+}
+
+static NSDictionary *parseReq(NSData *head) {
+    NSString *s = [[NSString alloc] initWithData:head encoding:NSASCIIStringEncoding];
+    if (!s.length) return nil;
+    NSArray *lines = [s componentsSeparatedByString:@"\r\n"];
+    if (!lines.count) return nil;
+    NSArray *parts = [lines[0] componentsSeparatedByString:@" "];
+    if (parts.count < 3) return nil;
+    NSString *method = parts[0], *path = parts[1], *host = nil;
+    long cl = 0;
+    for (NSUInteger i = 1; i < lines.count; i++) {
+        NSString *ln = lines[i];
+        if ([ln hasPrefix:@"Host:"] || [ln hasPrefix:@"host:"])
+            host = [[ln substringFromIndex:5] stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceCharacterSet]];
+        if ([ln hasPrefix:@"Content-Length:"] || [ln hasPrefix:@"content-length:"])
+            cl = [[[ln substringFromIndex:15] stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceCharacterSet]] longLongValue];
+    }
+    return @{ @"method": method, @"path": path,
+              @"host": host ?: @"", @"cl": @(cl) };
+}
+
+// 去掉 Accept-Encoding / Connection，加 Connection: close（上游回完就关，读"到关为止"即可）
+static NSData *buildUpstreamRequest(NSData *head, NSData *body) {
+    NSString *s = [[NSString alloc] initWithData:head encoding:NSASCIIStringEncoding];
+    NSMutableString *out = [NSMutableString string];
+    for (NSString *ln in [s componentsSeparatedByString:@"\r\n"]) {
+        if (!ln.length) continue;
+        NSString *l = ln.lowercaseString;
+        if ([l hasPrefix:@"accept-encoding:"] || [l hasPrefix:@"connection:"] ||
+            [l hasPrefix:@"proxy-connection:"]) continue;
+        [out appendFormat:@"%@\r\n", ln];
+    }
+    [out appendString:@"Connection: close\r\n\r\n"];
+    NSMutableData *d = [[out dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+    if (body.length) [d appendData:body];
+    return d;
+}
+
+static NSData *errorResponse(NSString *status, NSString *msg) {
+    NSString *b = msg ?: @"mitm error";
+    NSString *h = [NSString stringWithFormat:
+        @"HTTP/1.1 %@\r\nContent-Type: text/plain\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+        status, (unsigned long)b.length];
+    NSMutableData *d = [[h dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+    [d appendData:[b dataUsingEncoding:NSUTF8StringEncoding]];
+    return d;
+}
+
+// ============================ 上游转发（核心） ============================
+// 返回：上游完整响应（原样字节）。空 = 失败。
+static NSData *forwardRequest(NSString *host, NSData *reqHead, NSData *reqBody) {
+    struct addrinfo hints; memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    int r = o_getaddrinfo(host.UTF8String, "443", &hints, &res);
+    if (r != 0 || !res) { DLog(@"[up] DNS 失败 %@", host); return nil; }
+
+    int ufd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        ufd = o_socket(ai->ai_family, ai->ai_socktype ?: SOCK_STREAM, ai->ai_protocol);
+        if (ufd < 0) continue;
+        if (o_connect(ufd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(ufd); ufd = -1;
+    }
+    freeaddrinfo(res);
+    if (ufd < 0) { DLog(@"[up] connect 失败 %@", host); return nil; }
+    setSockTimeout(ufd, 30);
+
+    SSLContextRef c = makeClientCtx(ufd, host);
+    if (!c) { close(ufd); return nil; }
+    OSStatus hs = SSLHandshake(c);
+    if (hs != noErr) {
+        DLog(@"[up] 上游 TLS 握手失败 %@ st=%d（若 -9800/-9807 = 证书校验问题）", host, (int)hs);
+        SSLClose(c); CFRelease(c); close(ufd);
+        return nil;
+    }
+
+    NSData *outReq = buildUpstreamRequest(reqHead, reqBody);
+    size_t w = 0;
+    OSStatus sw = SSLWrite(c, outReq.bytes, outReq.length, &w);
+    if (sw != noErr) {
+        DLog(@"[up] 请求发送失败 st=%d", (int)sw);
+        SSLClose(c); CFRelease(c); close(ufd);
+        return nil;
+    }
+
+    NSMutableData *resp = [NSMutableData data];
+    char buf[16384];
+    for (;;) {
+        size_t got = 0;
+        OSStatus s = SSLRead(c, buf, sizeof buf, &got);
+        if (s == noErr && got > 0) { [resp appendBytes:buf length:got]; continue; }
+        break;   // errSSLClosedGraceful / 其它错误 / 0 字节 => 到头了
+    }
+    SSLClose(c); CFRelease(c); close(ufd);
+
+    // ======== STAGE 2 接入点：在这里把 resp 的明文喂给 bdyy.js 改写 ========
+    return resp;
+}
+
+// ============================ 本地 TLS 服务器 ============================
+static void *worker(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    setSockTimeout(cfd, 30);
+
+    SSLContextRef ctx = makeServerCtx(cfd);
+    if (!ctx) { close(cfd); return NULL; }
+    OSStatus hs = SSLHandshake(ctx);
+    if (hs != noErr) {
+        DLog(@"[mitm] 客户端 TLS 握手失败 fd=%d st=%d", cfd, (int)hs);
+        SSLClose(ctx); CFRelease(ctx); close(cfd);
+        return NULL;
+    }
+    DLog(@"[mitm] ★ 客户端 TLS 握手成功 fd=%d", cfd);
+
+    int served = 0;
+    for (;;) {
+        NSMutableData *head = [NSMutableData data];
+        if (tlsReadUntil(ctx, head, "\r\n\r\n", 4, 64 * 1024) != 0) break;
+        NSDictionary *req = parseReq(head);
+        if (!req) break;
+        NSString *method = req[@"method"], *path = req[@"path"], *host = req[@"host"];
+        long cl = [req[@"cl"] longValue];
+        DLog(@"[mitm] >> %@ http://%@%@ (body=%ld)", method, host, path, cl);
+        if (!host.length) { DLog(@"[mitm] 无 Host 头，断开"); break; }
+
+        NSMutableData *body = [NSMutableData data];
+        if (cl > 0 && cl < 64 * 1024 * 1024 &&
+            tlsReadBytes(ctx, body, (size_t)cl) != 0) { DLog(@"[mitm] 请求体读取失败"); break; }
+
+        NSData *resp = forwardRequest(host, head, body);
+        if (!resp.length) { DLog(@"[mitm] 上游无响应，断开"); break; }
+        size_t w = 0;
+        SSLWrite(ctx, resp.bytes, resp.length, &w);
+        DLog(@"[mitm] << %@ %@ -> %lu 字节", method, path, (unsigned long)resp.length);
+        Dump([NSString stringWithFormat:@"%@ http://%@%@", method, host, path], resp);
+        served++;
+        if (served > 100) break;
+    }
+    if (served) DLog(@"[mitm] 连接结束 fd=%d 共转发 %d 个请求", cfd, served);
+    SSLClose(ctx); CFRelease(ctx); close(cfd);
+    return NULL;
+}
+
+static void *acceptLoop(void *arg) {
+    int lfd = (int)(intptr_t)arg;
+    for (;;) {
+        struct sockaddr_storage sa; socklen_t sl = sizeof sa;
+        int cfd = accept(lfd, (struct sockaddr *)&sa, &sl);
+        if (cfd < 0) { if (errno == EINTR) continue; break; }
+        pthread_t t; pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &a, worker, (void *)(intptr_t)cfd) != 0) close(cfd);
+        pthread_attr_destroy(&a);
+    }
+    return NULL;
+}
+
+static int makeListener(int family, const struct sockaddr *addr, socklen_t addrlen) {
+    int fd = o_socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, addr, addrlen) < 0) { close(fd); return -1; }
+    if (listen(fd, 128) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+static void startServer(void) {
+    struct sockaddr_in sin; memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+    int v4 = makeListener(AF_INET, (struct sockaddr *)&sin, sizeof sin);
+    if (v4 < 0) { DLog(@"[mitm] IPv4 监听创建失败"); return; }
+    struct sockaddr_in b; socklen_t bl = sizeof b;
+    getsockname(v4, (struct sockaddr *)&b, &bl);
+    g_localPort = ntohs(b.sin_port);
+
+    int v6 = -1;
+    struct sockaddr_in6 sin6; memset(&sin6, 0, sizeof sin6);
+    sin6.sin6_family = AF_INET6;
+    sin6.sin6_addr = in6addr_loopback;
+    sin6.sin6_port = htons((uint16_t)g_localPort);
+    v6 = makeListener(AF_INET6, (struct sockaddr *)&sin6, sizeof sin6);
+    g_ipv6Up = (v6 >= 0);
+
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &a, acceptLoop, (void *)(intptr_t)v4);
+    if (v6 >= 0) { pthread_t t2; pthread_create(&t2, &a, acceptLoop, (void *)(intptr_t)v6); }
+    pthread_attr_destroy(&a);
+    DLog(@"[mitm] 监听 127.0.0.1:%d（IPv6=%@）", g_localPort, g_ipv6Up ? @"yes" : @"no");
 }
 
 // ============================ 入口 ============================
-__attribute__((constructor)) static void bodian_probe_init(void) {
-    DLog(@"========== bodian_probe v2 已加载 ==========");
-    DLog(@"环境: Flutter=%s  WKWebView=%s",
-         (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
-         objc_getClass("WKWebView") ? "yes" : "no");
-
-    scan_all_images();
-    check_dlsym();
-
-    o_getaddrinfo = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))
-                    dlsym(RTLD_DEFAULT, "getaddrinfo");
-    o_connect     = (int (*)(int, const struct sockaddr *, socklen_t))dlsym(RTLD_DEFAULT, "connect");
-    o_socket      = (int (*)(int, int, int))dlsym(RTLD_DEFAULT, "socket");
-    o_SSL_write   = (int (*)(void *, const void *, int))dlsym(RTLD_DEFAULT, "SSL_write");
-    o_SSL_read    = (int (*)(void *, void *, int))dlsym(RTLD_DEFAULT, "SSL_read");
-    o_SSL_write_ex = (int (*)(void *, const void *, size_t, size_t *))dlsym(RTLD_DEFAULT, "SSL_write_ex");
-    o_SSL_read_ex  = (int (*)(void *, void *, size_t, size_t *))dlsym(RTLD_DEFAULT, "SSL_read_ex");
-
-    // 只对"确实拿到了原始函数指针"的符号做重绑，避免把槽位指向会崩的包装
-    struct fbt_rebinding rb[8];
-    size_t rbn = 0;
-    if (o_SSL_write)    { rb[rbn].name = "SSL_write";    rb[rbn].replacement = (void *)my_SSL_write;    rb[rbn].replaced = (void **)&o_SSL_write;    rbn++; }
-    if (o_SSL_read)     { rb[rbn].name = "SSL_read";     rb[rbn].replacement = (void *)my_SSL_read;     rb[rbn].replaced = (void **)&o_SSL_read;     rbn++; }
-    if (o_SSL_write_ex) { rb[rbn].name = "SSL_write_ex"; rb[rbn].replacement = (void *)my_SSL_write_ex; rb[rbn].replaced = (void **)&o_SSL_write_ex; rbn++; }
-    if (o_SSL_read_ex)  { rb[rbn].name = "SSL_read_ex";  rb[rbn].replacement = (void *)my_SSL_read_ex;  rb[rbn].replaced = (void **)&o_SSL_read_ex;  rbn++; }
-    if (o_getaddrinfo)  { rb[rbn].name = "getaddrinfo";  rb[rbn].replacement = (void *)my_getaddrinfo;  rb[rbn].replaced = (void **)&o_getaddrinfo;  rbn++; }
-    if (o_socket)       { rb[rbn].name = "socket";       rb[rbn].replacement = (void *)my_socket;       rb[rbn].replaced = (void **)&o_socket;       rbn++; }
-    if (o_connect)      { rb[rbn].name = "connect";      rb[rbn].replacement = (void *)my_connect;      rb[rbn].replaced = (void **)&o_connect;      rbn++; }
-    int ret = rbn ? fbt_rebind(rb, rbn) : -2;
-    DLog(@"[rebind] fishhook ret=%d", ret);
-    DLog(@"[rebind] ==== 实际被替换的符号槽位（谁在动态链接它）====\n%s    (SSL_read/SSL_write 一条都没有 => 没人动态链接系统 BoringSSL)",
-         g_rb_log[0] ? g_rb_log : "");
-
-    Class ns = objc_getClass("NSURLSession");
-    if (ns) {
-        Method m;
-        m = class_getInstanceMethod(ns, @selector(dataTaskWithRequest:));
-        if (m) { o_dt_req = (id(*)(id,SEL,NSURLRequest*))method_getImplementation(m);
-                 method_setImplementation(m, (IMP)my_dt_req); }
-        m = class_getInstanceMethod(ns, @selector(dataTaskWithRequest:completionHandler:));
-        if (m) { o_dt_req_c = (id(*)(id,SEL,NSURLRequest*,ProbeCompletion))method_getImplementation(m);
-                 method_setImplementation(m, (IMP)my_dt_req_c); }
-        m = class_getInstanceMethod(ns, @selector(dataTaskWithURL:completionHandler:));
-        if (m) { o_dt_url_c = (id(*)(id,SEL,NSURL*,ProbeCompletion))method_getImplementation(m);
-                 method_setImplementation(m, (IMP)my_dt_url_c); }
-        m = class_getClassMethod(ns, @selector(sessionWithConfiguration:delegate:delegateQueue:));
-        if (m) { o_session = (id(*)(id,SEL,id,id,id))method_getImplementation(m);
-                 method_setImplementation(m, (IMP)my_session); }
+__attribute__((constructor)) static void bodian_mitm_init(void) {
+    DLog(@"========== bodian_probe v3 (进程内 MITM) 已加载 ==========");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:SandboxPath(@"bodian_mitm_off")]) {
+        DLog(@"[mitm] 检测到 bodian_mitm_off，本不启用（App 行为不变）");
+        return;
     }
-
-    DLog(@"========== 就绪：请进会员页/播放页/歌曲详情页，各停 5 秒 ==========");
+    initTargetHosts();
+    loadIdentity();
+    if (!g_serverCerts) { DLog(@"[cert] 无证书可用，MITM 不启用"); return; }
+    installHooks();          // 先装 hook（o_socket 等先就位），此时 g_mitmEnabled=0，connect 仍直连
+    startServer();
+    if (!g_localPort) { DLog(@"[mitm] 服务未启动"); return; }
+    g_mitmEnabled = 1;       // 服务就绪后再放行重定向
+    DLog(@"========== MITM 就绪：目标 443 将被重定向到 127.0.0.1:%d ==========", g_localPort);
 }
