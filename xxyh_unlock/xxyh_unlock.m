@@ -136,9 +136,98 @@ static void my_conn_async(id self, SEL _cmd, NSURLRequest *req, NSOperationQueue
     o_conn_async(self, _cmd, req, q, block);
 }
 
+// ============================ delegate 模式（v2 核心） ============================
+// App 用 dataTaskWithRequest: + 自己的 delegate 收数据。
+// 做法：hook sessionWithConfiguration:delegate:delegateQueue:，对 delegate 的类做
+//       类级 swizzle：didReceiveData 攒包不给 App，didComplete 时改好整份再回调。
+static NSMutableDictionary<NSValue *, NSMutableData *> *g_acc;
+static NSMutableSet<NSString *> *g_swizzledClasses;
+static NSMutableDictionary<NSString *, NSValue *> *g_origData;
+static NSMutableDictionary<NSString *, NSValue *> *g_origDone;
+
+static NSValue *taskKey(id task) { return [NSValue valueWithNonretainedObject:task]; }
+
+static IMP origOf(NSMutableDictionary<NSString *, NSValue *> *store, id self) {
+    NSValue *v = store[NSStringFromClass(object_getClass(self))];
+    return v ? (IMP)v.pointerValue : NULL;
+}
+
+static void my_didReceiveData(id self, SEL _cmd, NSURLSession *session,
+                              NSURLSessionDataTask *task, NSData *data) {
+    if (isTargetURL(task.originalRequest.URL)) {
+        NSValue *k = taskKey(task);
+        @synchronized (g_acc) {
+            NSMutableData *acc = g_acc[k];
+            if (!acc) { acc = [NSMutableData data]; g_acc[k] = acc; }
+            [acc appendData:data];
+        }
+        return;                      // 攒着，先不给 App
+    }
+    IMP o = origOf(g_origData, self);
+    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, session, task, data);
+}
+
+static void my_didComplete(id self, SEL _cmd, NSURLSession *session,
+                           NSURLSessionTask *task, NSError *error) {
+    if (isTargetURL(task.originalRequest.URL)) {
+        NSMutableData *acc = nil;
+        NSValue *k = taskKey(task);
+        @synchronized (g_acc) { acc = g_acc[k]; [g_acc removeObjectForKey:k]; }
+        if (acc && acc.length) {
+            LLog(@"★ 攒包完成 %lu 字节，开始改写", (unsigned long)acc.length);
+            NSData *patched = patchBody(acc);
+            IMP oData = origOf(g_origData, self);
+            if (oData)
+                ((void (*)(id, SEL, id, id, id))oData)(
+                    self, @selector(URLSession:dataTask:didReceiveData:), session, task, patched);
+        }
+    }
+    IMP o = origOf(g_origDone, self);
+    if (o) ((void (*)(id, SEL, id, id, id))o)(self, _cmd, session, task, error);
+}
+
+static void swizzleDelegateMethods(Class cls, NSString *cn) {
+    Method m1 = class_getInstanceMethod(cls, @selector(URLSession:dataTask:didReceiveData:));
+    if (m1) {
+        g_origData[cn] = [NSValue valueWithPointer:method_getImplementation(m1)];
+        method_setImplementation(m1, (IMP)my_didReceiveData);
+    } else {
+        class_addMethod(cls, @selector(URLSession:dataTask:didReceiveData:),
+                        (IMP)my_didReceiveData, "v@:@@@");
+    }
+    Method m2 = class_getInstanceMethod(cls, @selector(URLSession:task:didCompleteWithError:));
+    if (m2) {
+        g_origDone[cn] = [NSValue valueWithPointer:method_getImplementation(m2)];
+        method_setImplementation(m2, (IMP)my_didComplete);
+    } else {
+        class_addMethod(cls, @selector(URLSession:task:didCompleteWithError:),
+                        (IMP)my_didComplete, "v@:@@@");
+    }
+    LLog(@"[delegate] 已 hook 代理类 %@", cn);
+}
+
+static id (*o_session)(id, SEL, id, id, id);
+static id my_session(id self, SEL _cmd, id config, id delegate, id queue) {
+    id r = o_session(self, _cmd, config, delegate, queue);
+    if (delegate) {
+        NSString *cn = NSStringFromClass(object_getClass(delegate));
+        @synchronized (g_swizzledClasses) {
+            if (![g_swizzledClasses containsObject:cn]) {
+                [g_swizzledClasses addObject:cn];
+                swizzleDelegateMethods(object_getClass(delegate), cn);
+            }
+        }
+    }
+    return r;
+}
+
 // ============================ 入口 ============================
 __attribute__((constructor)) static void xxyh_init(void) {
-    LLog(@"========== xxyh_unlock 已加载 ==========");
+    LLog(@"========== xxyh_unlock v2 已加载 ==========");
+    g_acc           = [NSMutableDictionary dictionary];
+    g_swizzledClasses = [NSMutableSet set];
+    g_origData      = [NSMutableDictionary dictionary];
+    g_origDone      = [NSMutableDictionary dictionary];
     Class ss = objc_getClass("NSURLSession");
     if (ss) {
         swizzle(ss, @selector(dataTaskWithRequest:completionHandler:),
@@ -147,6 +236,8 @@ __attribute__((constructor)) static void xxyh_init(void) {
                 (IMP)my_dt_url_c, (IMP *)&o_dt_url_c);
         swizzle(ss, @selector(dataTaskWithRequest:),
                 (IMP)my_dt_req, (IMP *)&o_dt_req);
+        swizzle(ss, @selector(sessionWithConfiguration:delegate:delegateQueue:),
+                (IMP)my_session, (IMP *)&o_session);
     }
     Class conn = objc_getClass("NSURLConnection");
     if (conn) {
