@@ -1,0 +1,28 @@
+name: Build xxyh_unlock.dylib
+
+on: [workflow_dispatch, push]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile iOS arm64 dylib
+        run: |
+          SRC=$(find . -name xxyh_unlock.m | head -n 1)
+          echo "Source file: $SRC"
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 -fobjc-arc \
+            -Wno-deprecated-declarations \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation \
+            -o xxyh_unlock.dylib "$SRC"
+
+      - name: Verify
+        run: file xxyh_unlock.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xxyh_unlock.dylib
+          path: xxyh_unlock.dylib
