@@ -453,6 +453,9 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
     return r;
 }
 
+static BOOL replace_in_data(NSMutableData *d, const char *pat, const char *rep);
+static BOOL replace_json_string_value(NSMutableData *d, const char *keyPrefix, const char *newValue);
+
 // 严格等长改写：改 vip_status/vip_level/vip_expire_at，并用 website 腾出等量空间，总长度不变
 static int patch_body_inplace(unsigned char *body, size_t bodyLen) {
     if (!body || bodyLen < 8) return 0;
@@ -645,7 +648,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v21 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v22 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
