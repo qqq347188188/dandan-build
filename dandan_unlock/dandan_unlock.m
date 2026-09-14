@@ -171,7 +171,11 @@ static NSString *DDLogPath(void) {
     });
     return p;
 }
+// 日志总开关：0 = 彻底静音（不写文件、不打印）；需要排查时改成 1
+#define DANDAN_LOG 0
+
 static void DLog(NSString *fmt, ...) {
+#if DANDAN_LOG
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -182,6 +186,9 @@ static void DLog(NSString *fmt, ...) {
         if (!fh) [line writeToFile:DDLogPath() atomically:YES encoding:NSUTF8StringEncoding error:NULL];
         else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
     } @catch (__unused NSException *e) {}
+#else
+    (void)fmt;
+#endif
 }
 
 // ============================ 工具 ============================
@@ -648,7 +655,7 @@ __attribute__((constructor)) static void dandan_unlock_init(void) {
         if (mg) { o_uccGetter = (id(*)(id,SEL))method_getImplementation(mg); method_setImplementation(mg, (IMP)my_uccGetter); }
     }
 
-    DLog(@"=== dandan_unlock v22 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
+    DLog(@"=== dandan_unlock v23 已加载 (rebind=%d, Flutter=%s, WKWebView=%s) ===", ret,
          (NSClassFromString(@"FlutterViewController") || NSClassFromString(@"FlutterEngine")) ? "yes" : "no",
          wv ? "yes" : "no");
 }
