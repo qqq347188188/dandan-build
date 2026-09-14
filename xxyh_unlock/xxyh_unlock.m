@@ -102,6 +102,15 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     LLog(@"[hook] %@", NSStringFromSelector(sel));
 }
 
+// 类方法版（sessionWithConfiguration:delegate:delegateQueue: 是 + 方法）
+static void swizzleClass(Class cls, SEL sel, IMP newImp, IMP *origOut) {
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) { LLog(@"[warn] 找不到类方法 %@", NSStringFromSelector(sel)); return; }
+    *origOut = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    LLog(@"[hook] +%@", NSStringFromSelector(sel));
+}
+
 static id (*o_dt_req_c)(id, SEL, NSURLRequest *, id);
 static id my_dt_req_c(id self, SEL _cmd, NSURLRequest *req, id completion) {
     NSURL *u = req.URL;
@@ -236,8 +245,8 @@ __attribute__((constructor)) static void xxyh_init(void) {
                 (IMP)my_dt_url_c, (IMP *)&o_dt_url_c);
         swizzle(ss, @selector(dataTaskWithRequest:),
                 (IMP)my_dt_req, (IMP *)&o_dt_req);
-        swizzle(ss, @selector(sessionWithConfiguration:delegate:delegateQueue:),
-                (IMP)my_session, (IMP *)&o_session);
+        swizzleClass(ss, @selector(sessionWithConfiguration:delegate:delegateQueue:),
+                     (IMP)my_session, (IMP *)&o_session);
     }
     Class conn = objc_getClass("NSURLConnection");
     if (conn) {
