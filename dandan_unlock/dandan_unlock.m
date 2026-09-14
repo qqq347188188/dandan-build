@@ -482,7 +482,7 @@ static BOOL replace_json_string_value_bytes(NSMutableData *d, const char *keyPre
 static NSData *fit_utf8(NSString *desired, size_t target) {
     if (target == 0) return [NSData data];
     NSData *d = [desired dataUsingEncoding:NSUTF8StringEncoding];
-    if (!d.length) return [NSData dataWithLength:target];
+       if (!d.length) { NSMutableData *m = [NSMutableData dataWithLength:target]; memset(m.mutableBytes, ' ', target); return m; }
     const unsigned char *b = d.bytes;
     size_t n = d.length;
     if (n <= target) {
