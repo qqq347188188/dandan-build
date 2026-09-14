@@ -463,25 +463,105 @@ static ssize_t my_write(int fd, const void *buf, size_t len) {
 static BOOL replace_in_data(NSMutableData *d, const char *pat, const char *rep);
 static BOOL replace_json_string_value(NSMutableData *d, const char *keyPrefix, const char *newValue);
 
-// 严格等长改写：改 vip_status/vip_level/vip_expire_at，并用 website 腾出等量空间，总长度不变
+// 在 data 里做字节替换（值以 bytes 给出，可为任意长度）
+static BOOL replace_json_string_value_bytes(NSMutableData *d, const char *keyPrefix, NSData *newValue) {
+    size_t kl = strlen(keyPrefix);
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    size_t len = d.length;
+    const unsigned char *p = (const unsigned char *)fb_memmem(b, len, keyPrefix, kl);
+    if (!p) return NO;
+    size_t vs = (size_t)(p - b) + kl;
+    size_t ve = vs;
+    while (ve < len && b[ve] != '"' && b[ve] != '\\') ve++;
+    if (ve >= len || b[ve] != '"') return NO;
+    [d replaceBytesInRange:NSMakeRange(vs, ve - vs) withBytes:newValue.bytes length:newValue.length];
+    return YES;
+}
+
+// 把 desired（UTF-8）截断/补空格到正好 target 字节（不切断多字节字符）
+static NSData *fit_utf8(NSString *desired, size_t target) {
+    if (target == 0) return [NSData data];
+    NSData *d = [desired dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d.length) return [NSData dataWithLength:target];
+    const unsigned char *b = d.bytes;
+    size_t n = d.length;
+    if (n <= target) {
+        NSMutableData *m = [NSMutableData dataWithBytes:b length:n];
+        for (size_t i = n; i < target; i++) [m appendBytes:" " length:1];
+        return m;
+    }
+    size_t cut = target;
+    while (cut > 0 && (b[cut] & 0xC0) == 0x80) cut--;   // 回退到字符边界
+    return [NSData dataWithBytes:b length:cut];
+}
+
+// 量某个 JSON 字符串字段值的字节长度；找不到返回 -1
+static long json_string_value_len(NSData *d, const char *keyPrefix) {
+    size_t kl = strlen(keyPrefix);
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    size_t len = d.length;
+    const unsigned char *p = (const unsigned char *)fb_memmem(b, len, keyPrefix, kl);
+    if (!p) return -1;
+    size_t vs = (size_t)(p - b) + kl;
+    size_t ve = vs;
+    while (ve < len && b[ve] != '"' && b[ve] != '\\') ve++;
+    if (ve >= len || b[ve] != '"') return -1;
+    return (long)(ve - vs);
+}
+
+// 严格等长改写 v2：vip 字段让 body 变长时，按需向 avatar / website / username 借空间。
+// 服务器返回的 username/avatar 长度怎么变都能配平（App 内改名后不再失效）。
 static int patch_body_inplace(unsigned char *body, size_t bodyLen) {
     if (!body || bodyLen < 8) return 0;
+    NSData *orig = [NSData dataWithBytes:body length:bodyLen];
+    long U = json_string_value_len(orig, "\"username\":\"");
+    long A = json_string_value_len(orig, "\"avatar_url\":\"");
+    long W = json_string_value_len(orig, "\"website\":\"");
+
     NSMutableData *nb = [NSMutableData dataWithBytes:body length:bodyLen];
     BOOL c1 = replace_in_data(nb, "\"vip_status\":false", "\"vip_status\":true");
     BOOL c2 = replace_in_data(nb, "\"vip_level\":0", "\"vip_level\":3");
-    BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null", "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
+    BOOL c3 = replace_in_data(nb, "\"vip_expire_at\":null",
+                              "\"vip_expire_at\":\"2099-09-19T22:21:06.147807+00:00\"");
     if (!(c1 || c2 || c3)) return 0;
-    // 与脚本一致：同时替换 username / avatar_url（也正好腾出空间）
-    replace_json_string_value(nb, "\"username\":\"", "小柳是个超霸");
-    replace_json_string_value(nb, "\"avatar_url\":\"", "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
+
+    NSInteger need = (NSInteger)nb.length - (NSInteger)bodyLen;  // >0 = 还需腾出的字节数
+    BOOL avatarDone = NO, usernameDone = NO;
+
+    if (need > 0) {
+        if (A > 0) {                                             // 先借头像
+            if (A - 85 >= need) {
+                replace_json_string_value(nb, "\"avatar_url\":\"",
+                    "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
+                need -= (A - 85);
+            } else {
+                replace_json_string_value(nb, "\"avatar_url\":\"", "");
+                need -= A;
+            }
+            avatarDone = YES;
+        }
+        if (need > 0 && W > 0) {                                 // 再借 website
+            replace_json_string_value(nb, "\"website\":\"", "");
+            need -= W;
+        }
+        if (need > 0 && U > 0 && (size_t)U >= (size_t)need) {    // 最后借用户名（尽量保住名字）
+            replace_json_string_value_bytes(nb, "\"username\":\"",
+                fit_utf8(@"小柳是个超霸", (size_t)U - (size_t)need));
+            usernameDone = YES;
+            need = 0;
+        }
+        if (need > 0) return 0;                                  // 实在腾不出：放弃本次
+    }
+
+    // 空间允许时保住自定义名字/头像（以下操作都不会让 body 变长）
+    if (!usernameDone && U > 0)
+        replace_json_string_value_bytes(nb, "\"username\":\"", fit_utf8(@"小柳是个超霸", (size_t)U));
+    if (!avatarDone && A >= 85)
+        replace_json_string_value(nb, "\"avatar_url\":\"",
+            "https://i.ibb.co/NgghpGgn/11zon-A9-CBAC35-2-CA3-4-E7-F-923-D-7304-EEB40635.webp");
 
     NSInteger delta = (NSInteger)nb.length - (NSInteger)bodyLen;
-    if (delta > 0) {
-        // 变长了：把 website 的值清空来腾空间
-        replace_json_string_value(nb, "\"website\":\"", "");
-        delta = (NSInteger)nb.length - (NSInteger)bodyLen;
-    }
-    if (delta > 0) return 0;                 // 还是太长，放弃
+    if (delta > 0) return 0;                 // 太长，放弃
     if (delta < 0) {
         // 变短了：在第一个字符后补空格（JSON 允许空白），凑齐长度
         NSMutableData *pad = [NSMutableData data];
