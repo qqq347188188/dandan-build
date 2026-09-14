@@ -79,6 +79,7 @@ static NSData *patchBody(NSData *data) {
 }
 
 // 包一层 completionHandler：命中则改 body
+typedef void (^XXYHComp)(NSData *, NSURLResponse *, NSError *);
 static id wrapCompletion(NSURL *u, id completion) {
     if (!completion) return completion;
     XXYHComp orig = (XXYHComp)completion;
